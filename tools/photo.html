@@ -1,0 +1,1972 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Photo renderer</title>
+<style>html,body{margin:0;background:#000}</style>
+</head>
+<body>
+<script>
+// Photographic backgrounds of the spices. The page ray-marches 3D scenes on
+// the GPU with WebGL2: soft shadows, ambient occlusion, glossy reflections
+// and depth of field, then a filmic tone curve and grain. tools/photo.mjs
+// calls setup() once and renderPhoto() for each image. Chromium needs
+// --use-angle=vulkan to use the GPU. Without it, SwiftShader renders on the
+// CPU and is very slow.
+//
+// Each image adds up many samples. Every sample moves the pixel a little for
+// anti-aliasing and moves the camera inside the lens for depth of field. The
+// frame renders in tiles, so no single draw call runs long on the GPU.
+//
+// Scenes:
+//   wordmark  the Omarchy wordmark spelled in whole pieces, or sifted through
+//             a stencil in the ground spice, on a table
+//   bowl      the spice in a small bowl, with pieces on the table
+//   ground    a wooden spoon heaped with the ground spice
+//   whole     whole pieces from a low angle, with a shallow focus
+//   top       the stenciled wordmark from straight above, the still under
+//             the dust video
+//
+// One unit is 1 cm. Each whole spice is a "kind": a form with its size,
+// shape and colors. A blend has up to 6 kinds. A field repeats the pieces of
+// the kinds on a grid with random turns, so the shaders never store a list.
+
+const canvas = document.createElement('canvas');
+const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+let contextLosses = 0;
+canvas.addEventListener('webglcontextlost', e => { contextLosses++; e.preventDefault(); });
+window.diagnostics = () => ({ contextLosses, lost: gl.isContextLost(), error: gl.getError() });
+gl.getExtension('EXT_color_buffer_float');
+const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+let logoTexture = null, logoInfo = null;
+const programs = {};
+
+// ---------- colors ----------
+
+function rgb(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function lin(hex) { return rgb(hex).map(v => { v /= 255; return v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; }); }
+function mix(a, b, t) { const pa = rgb(a), pb = rgb(b); return '#' + pa.map((v, i) => Math.round(v * (1 - t) + pb[i] * t).toString(16).padStart(2, '0')).join(''); }
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- the wordmark as a distance field ----------
+
+// The letters become a signed distance field in logo units (the SVG is
+// 1215 x 285). The shaders place pieces inside it or sift powder through it.
+window.setup = paths => {
+  const SCALE = 3, PAD = 64, w = 1215 * SCALE + PAD * 2, h = 285 * SCALE + PAD * 2;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#000'; cx.fillRect(0, 0, w, h);
+  cx.translate(PAD, PAD); cx.scale(SCALE, SCALE); cx.fillStyle = '#fff';
+  paths.forEach(p => cx.fill(new Path2D(p.d), p.evenodd ? 'evenodd' : 'nonzero'));
+  const img = cx.getImageData(0, 0, w, h).data;
+  const inside = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) inside[i] = img[i * 4] > 127 ? 1 : 0;
+  const dOut = edt(inside, w, h, 0), dIn = edt(inside, w, h, 1);
+  const field = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) field[i] = (Math.sqrt(dOut[i]) - Math.sqrt(dIn[i])) / SCALE;
+  logoTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, logoTexture);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, field);
+  const filter = floatLinear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  logoInfo = { w, h, scale: SCALE, pad: PAD };
+  return true;
+};
+
+// Squared Euclidean distance to the nearest pixel whose value differs from
+// `of`, by the Felzenszwalb and Huttenlocher method.
+function edt(mask, w, h, of) {
+  const INF = 1e20, d = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) d[i] = mask[i] === of ? INF : 0;
+  const n = Math.max(w, h), f = new Float64Array(n), out = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  const pass = (len, get, set) => {
+    for (let q = 0; q < len; q++) f[q] = get(q);
+    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < len; q++) {
+      let s;
+      do { const p = v[k]; s = ((f[q] + q * q) - (f[p] + p * p)) / (2 * q - 2 * p); if (s <= z[k]) k--; else break; } while (k >= 0);
+      k++; v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    k = 0;
+    for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; const p = v[k]; out[q] = (q - p) * (q - p) + f[p]; }
+    for (let q = 0; q < len; q++) set(q, out[q]);
+  };
+  for (let x = 0; x < w; x++) pass(h, y => d[y * w + x], (y, val) => { d[y * w + x] = val; });
+  for (let y = 0; y < h; y++) pass(w, x => d[y * w + x], (x, val) => { d[y * w + x] = val; });
+  return d;
+}
+
+// ---------- shaders ----------
+
+const VERT = `#version 300 es
+void main() { vec2 p = vec2(gl_VertexID & 1, gl_VertexID >> 1) * 4.0 - 1.0; gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const COMMON = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+out vec4 outColor;
+uniform vec2 uRes;
+uniform vec2 uJitter;
+uniform vec2 uLens;
+uniform float uSeed;
+uniform vec3 uCamPos, uCamTarget;
+uniform float uFocal, uAperture, uFocus;
+uniform vec3 uKeyDir, uKeyCol, uFillCol, uRimDir, uRimCol;
+uniform float uDay, uSoft, uIndex, uTable;
+// uScene is the scale of the scene. The shadows and the occlusion use it, so a
+// field of poppy seeds and a bundle of vanilla get the same soft light.
+uniform float uScene;
+// uDebug turns parts of the light off for tests: 1 the shadows, 2 the window,
+// 4 the occlusion and 8 the reflections. renderPhoto() takes it as opts.debug.
+uniform int uDebug;
+uniform vec3 cBg, cDark, cGlaze, cTableA, cTableB, cGround, cGround2, cMace, cSpeck1, cSpeck2;
+uniform vec3 cBokeh[6];
+uniform sampler2D uLogo;
+uniform vec4 uLogoInfo;
+uniform float uLogoK;
+// The kinds of pieces. A: form, size in cm, p0, p1. B: p2 to p5.
+// G: wrinkle, gloss, light through the piece, bloom. F: half height, half
+// width, bounding radius, cumulative weight. H: roll mode, mace share.
+uniform vec4 uKA[6], uKB[6], uKG[6], uKF[6], uKH[6];
+uniform vec3 uKC[6], uKD[6];
+uniform int uKinds;
+// The field: cell size along and across, the turn of an aligned field (or
+// -1 for random turns), and the share of the second layer. uFieldMode:
+// 0 the table, 1 a heap in the bowl, 2 the letters of the wordmark.
+uniform vec4 uField;
+uniform int uFieldMode, uLayers;
+uniform vec2 uFieldMax;  // the largest size of a piece in the field, and its largest bounding radius
+// Beyond uFar from the camera, the field is a plain surface at uFarY. The depth
+// of field blurs it there anyway, and long rays over the field cost the most.
+uniform float uFar, uFarY;
+// The highest point that any piece of the field reaches. Up to twice this
+// height, map() measures the pieces. Above that, a plane at uTop stands in
+// for them. The gap keeps the stand-in at least uTop away, so a ray never
+// stops on it and a soft shadow never darkens under it.
+uniform float uTop;
+uniform vec4 uHeap;      // x, z, radius, height of the heap
+uniform float uHeapBase; // height of the rim of the heap above the bowl base
+// Single pieces placed by hand: x, z, turn, kind. B: lift, roll, scale, tilt.
+uniform vec4 uP[16], uPB[16];
+uniform int uPropCount;
+// Powder: uMound is a heap (x, z, radius, height). uPowder: grind, stencil
+// height, spill, mode (0 none, 1 mound, 2 stencil, 3 spoon heap).
+uniform vec4 uMound, uPowder;
+uniform vec4 uBowl;      // outer radius, height, wall, material
+uniform vec3 uBowlPos;
+uniform vec4 uSpoon;     // x, z, turn, scale (0 for no spoon)
+
+const float PI = 3.14159265;
+// Loops start at ZERO, a uniform that is always 0. The driver cannot unroll
+// them, so the shaders stay small and compile in seconds.
+uniform int uZero;
+#define ZERO min(uZero, 0)
+
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+vec2 hash22(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz) * p3.zy); }
+vec4 hash42(vec2 p) { vec4 p4 = fract(vec4(p.xyxy) * vec4(.1031, .1030, .0973, .1099)); p4 += dot(p4, p4.wzxy + 33.33); return fract((p4.xxyz + p4.yzzw) * p4.zywx); }
+float hash13(vec3 p3) { p3 = fract(p3 * .1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+float noise2(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y); }
+float noise3(vec3 p) { vec3 i = floor(p), f = fract(p); vec3 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash13(i), hash13(i + vec3(1, 0, 0)), u.x), mix(hash13(i + vec3(0, 1, 0)), hash13(i + vec3(1, 1, 0)), u.x), u.y),
+             mix(mix(hash13(i + vec3(0, 0, 1)), hash13(i + vec3(1, 0, 1)), u.x), mix(hash13(i + vec3(0, 1, 1)), hash13(i + vec3(1, 1, 1)), u.x), u.y), u.z); }
+float fbm2(vec2 p) { float s = 0.0, a = .5; for (int i = ZERO; i < 6; i++) { s += a * noise2(p); p = p * 2.03 + vec2(1.7, 9.2); a *= .5; } return s; }
+float fbm3(vec3 p) { float s = 0.0, a = .5; for (int i = ZERO; i < 4; i++) { s += a * noise3(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= .5; } return s; }
+// Distance to the nearest cell edge of a 2D Voronoi pattern, and the cell id.
+vec2 voronoi(vec2 p) {
+  vec2 n = floor(p), f = fract(p), mg, mr; float md = 8.0;
+  for (int j = ZERO - 1; j <= 1; j++) for (int i = ZERO - 1; i <= 1; i++) {
+    vec2 g = vec2(i, j), o = hash22(n + g), r = g + o - f; float d = dot(r, r);
+    if (d < md) { md = d; mr = r; mg = g; }
+  }
+  md = 8.0;
+  for (int j = ZERO - 2; j <= 2; j++) for (int i = ZERO - 2; i <= 2; i++) {
+    vec2 g = mg + vec2(i, j), o = hash22(n + g), r = g + o - f;
+    if (dot(mr - r, mr - r) > .00001) md = min(md, dot(.5 * (mr + r), normalize(r - mr)));
+  }
+  return vec2(md, hash12(n + mg));
+}
+
+float smin(float a, float b, float k) { float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h * h * k * .25; }
+float smax(float a, float b, float k) { return -smin(-a, -b, k); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+float sdEllipsoid(vec3 p, vec3 r) { float k0 = length(p / r); float k1 = length(p / (r * r)); return k0 * (k0 - 1.0) / k1; }
+float sdCylinder(vec3 p, float h, float r) { vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h); return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)); }
+float sdTorus(vec3 p, vec2 t) { vec2 q = vec2(length(p.xz) - t.x, p.y); return length(q) - t.y; }
+float sdRoundBox(vec3 p, vec3 b, float r) { vec3 q = abs(p) - b + r; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r; }
+float sdCapsule(vec3 p, vec3 a, vec3 b, float r) { vec3 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); return length(pa - ba * h) - r; }
+float sdVesica(vec2 p, float r, float d) { p = abs(p); float b = sqrt(r * r - d * d); return ((p.y - b) * d > p.x * b) ? length(p - vec2(0.0, b)) : length(p - vec2(-d, 0.0)) - r; }
+// A thin plate from a 2D distance and a half thickness.
+float extrude(float d2, float y, float h) { vec2 w = vec2(d2, abs(y) - h); return min(max(w.x, w.y), 0.0) + length(max(w, 0.0)); }
+float sdTrapezoid(vec2 p, float r1, float r2, float he) {
+  vec2 k1 = vec2(r2, he), k2 = vec2(r2 - r1, 2.0 * he);
+  p.x = abs(p.x);
+  vec2 ca = vec2(p.x - min(p.x, (p.y < 0.0) ? r1 : r2), abs(p.y) - he);
+  vec2 cb = p - k1 + k2 * clamp(dot(k1 - p, k2) / dot(k2, k2), 0.0, 1.0);
+  float s = (cb.x < 0.0 && ca.y < 0.0) ? -1.0 : 1.0;
+  return s * sqrt(min(dot(ca, ca), dot(cb, cb)));
+}
+
+vec3 env(vec3 d);
+
+// Soft disc lights far behind the subject, already out of focus.
+vec3 bokeh(vec3 d) {
+  vec3 col = vec3(0.0);
+  float az = atan(d.x, -d.z), el = asin(clamp(d.y, -1.0, 1.0));
+  vec2 g = vec2(az, el) * vec2(11.0, 14.0);
+  for (int j = ZERO - 1; j <= 1; j++) for (int i = ZERO - 1; i <= 1; i++) {
+    vec2 c = floor(g) + vec2(i, j);
+    float h = hash12(c + uIndex * 3.1);
+    if (h < .62) continue;
+    vec2 o = hash22(c + 7.7) * .8 + .1;
+    float r = .22 + hash12(c + 3.3) * .32;
+    float dist = length(g - c - o);
+    float disc = smoothstep(r, r * .82, dist) * (.75 + .25 * smoothstep(r * .5, r, dist));
+    vec3 tint = cBokeh[int(hash12(c + 1.9) * 5.99)];
+    col += disc * tint * (.5 + 1.3 * hash12(c + 5.5));
+  }
+  return col * smoothstep(-.05, .2, d.y);
+}
+
+vec3 env(vec3 d) {
+  vec3 key = normalize(uKeyDir);
+  if (uDay > .5) {
+    vec3 col = mix(vec3(.62, .60, .58), vec3(1.0, .99, .97), smoothstep(-.4, .7, d.y)) * 1.15;
+    col = mix(col, col * cBg * 1.25, .35);
+    float win = smoothstep(.72, .93, dot(d, key));
+    return col + win * vec3(3.4, 3.35, 3.2);
+  }
+  vec3 col = cDark * .18 * (.55 + .45 * d.y);
+  col += smoothstep(.80, .97, dot(d, key)) * uKeyCol * 2.6;
+  col += bokeh(d) * .45;
+  return col;
+}
+
+float ggx(vec3 n, vec3 h, float r) { float a = r * r, a2 = a * a; float nh = max(dot(n, h), 0.0); float d = nh * nh * (a2 - 1.0) + 1.0; return a2 / (PI * d * d); }
+float schlick(float c, float f0) { return f0 + (1.0 - f0) * pow(1.0 - c, 5.0); }
+`;
+
+// The table under every scene. kind: 0 walnut, 1 slate, 2 marble, 3 linen, 4 oak.
+const TABLE = `
+vec3 tableColor(vec3 p, out float rough, out vec3 bump) {
+  rough = .55; bump = vec3(0.0);
+  int kind = int(uTable + .5);
+  if (kind == 0 || kind == 4) {
+    float plank = floor(p.z / 6.0);
+    vec2 q = vec2(p.x * .035 + plank * 3.7, p.z * .9 + plank * 1.3);
+    float grain = fbm2(vec2(q.x * 4.0, q.y * .25));
+    float rings = sin((grain * 9.0 + p.z * .55 + plank) * 2.2) * .5 + .5;
+    float fine = noise2(vec2(p.x * 3.0, p.z * 40.0));
+    float t = clamp(rings * .55 + fine * .25 + grain * .35, 0.0, 1.0);
+    float seam = smoothstep(.04, 0.0, abs(fract(p.z / 6.0) - .0)) + smoothstep(.04, 0.0, abs(fract(p.z / 6.0) - 1.0));
+    rough = mix(.38, .62, fine);
+    bump = vec3(0.0, 0.0, (fine - .5) * .05);
+    return mix(cTableA, cTableB, t) * (1.0 - seam * .6);
+  }
+  if (kind == 1) {
+    float n = fbm2(p.xz * .35);
+    rough = .7;
+    bump = vec3((noise2(p.xz * 6.0) - .5) * .06, 0.0, (noise2(p.xz * 6.0 + 9.0) - .5) * .06);
+    return mix(cTableA, cTableB, n);
+  }
+  if (kind == 2) {
+    vec2 q = p.xz * .09;
+    vec2 w = vec2(fbm2(q * 1.3), fbm2(q * 1.3 + 7.1)) * 2.2;
+    float v = abs(fbm2(q * 1.7 + w) - .5);
+    float vein = exp(-v * 40.0) * .65 + exp(-v * 11.0) * .2;
+    rough = .22;
+    return mix(cTableA, cTableB, vein);
+  }
+  float weave = (sin(p.x * 26.0) * .5 + .5) * (sin(p.z * 26.0) * .5 + .5);
+  float slub = noise2(vec2(p.x * 2.0, p.z * 30.0)) * .5 + noise2(vec2(p.x * 30.0, p.z * 2.0)) * .5;
+  rough = .9;
+  bump = vec3((weave - .5) * .05, 0.0, (slub - .5) * .05);
+  return mix(cTableA, cTableB, clamp(weave * .35 + slub * .5, 0.0, 1.0));
+}
+`;
+
+// The shapes of the whole spices. Each form works in its own frame: the long
+// axis is x, from -0.5 to 0.5, and y is up. s is a random number of the
+// piece, so no 2 pieces look the same.
+const PIECES = `
+// Revolves a profile around the x axis. r is the radius at q.x, and k keeps
+// the march safe where the profile is steep.
+float revolved(vec3 q, float r, float flat_, float k) {
+  float rad = length(vec2(q.y / flat_, q.z));
+  return max((rad - r) * k * min(flat_, 1.0), abs(q.x) - .5);
+}
+
+#ifdef HAS_BERRY
+float sdBerry(vec3 q, int k, float s) {
+  vec4 A = uKA[k], B = uKB[k], G = uKG[k];
+  float wr = G.x, ribs = A.w, tail = B.x, elong = max(B.y, 1.0), mode = B.z, fl = B.w > 0.0 ? B.w : 1.0;
+  float r = .5 / elong;
+  float d = sdEllipsoid(q, vec3(.5, r * fl, r));
+  if (ribs > 0.0) {
+    float ang = atan(q.z, q.y);
+    float rib = .5 + .5 * cos(ribs * ang + .6 * sin(q.x * 6.0));
+    d -= .02 * pow(rib, 5.0) * smoothstep(.5, .25, abs(q.x));
+  }
+  if (wr > 0.0) {
+    vec3 w = q * (mode > 3.5 && mode < 4.5 ? 9.0 : 19.0) + s * 17.0;
+    float n = sin(w.x) * sin(w.y * 1.13 + 1.7) * sin(w.z * .91 + 2.3);
+    d += wr * .03 * (abs(n) - .4);
+  }
+  if (mode > .5 && mode < 1.5) d = smax(d, -(length(q - vec3(0.0, 0.0, r * .98)) - r * .34), r * .2);
+  if (mode > 1.5 && mode < 2.5) d = smin(d, sdTorus((q - vec3(.47, 0.0, 0.0)).yxz, vec2(.09, .028)), .03);
+  if (mode > 5.5) d += .06 * (noise3(q * 2.6 + s * 9.0) - .5);
+  if (mode > 4.5 && mode < 5.5) d += .035 * sin(q.x * 9.0 + s * 20.0) * sin(q.z * 8.0 + s * 9.0) + .02 * sin(q.y * 11.0 + s * 4.0);
+  if (tail > 0.0) d = smin(d, sdCapsule(q, vec3(-.45, 0.0, 0.0), vec3(-.5 - tail * .5, .05, .03), .035), .05);
+  return d * .85;
+}
+#endif
+
+#ifdef HAS_SEED
+float sdSeed(vec3 q, int k, float s) {
+  vec4 A = uKA[k], B = uKB[k], G = uKG[k];
+  float w = A.z, fl = A.w, curve = B.x, ridges = B.y, mode = B.z, stalk = B.w;
+  float hw = w * .5;
+  q.z -= curve * (.25 - q.x * q.x);
+  float d;
+  if (mode < .5) {
+    // A spindle: a lens shape with pointed ends, turned around its axis.
+    float rr = (.25 / hw + hw) * .5, dd = (.25 / hw - hw) * .5;
+    vec2 p2 = vec2(length(vec2(q.y / fl, q.z)), q.x);
+    d = sdVesica(p2, rr, dd) * min(fl, 1.0);
+    if (ridges > 0.0) {
+      float ang = atan(q.z, q.y / fl);
+      d -= hw * .12 * pow(.5 + .5 * cos(ridges * ang), 4.0) * smoothstep(.5, .25, abs(q.x));
+    }
+  } else if (mode < 1.5) {
+    // Angular: a teardrop with 3 soft sides and a rough skin
+    vec3 p = q; p.z /= mix(.55, 1.0, smoothstep(-.55, .25, q.x));
+    p.y /= mix(.55, 1.0, smoothstep(-.55, .25, q.x));
+    float a = atan(p.z, p.y) + s * 6.2831;
+    float rr = 1.0 + .16 * cos(3.0 * a);
+    d = sdEllipsoid(vec3(p.x, p.y / rr, p.z / rr), vec3(.5, hw * .9, hw)) * .6;
+    d += G.x * .02 * (noise3(q * 12.0 + s * 21.0) - .5);
+  } else if (mode < 2.5) {
+    // A box with a groove across one face.
+    vec3 b = q; b.x += .08 * b.z / hw * (fract(s * 5.0) - .5);
+    vec3 ext = vec3(.46, hw * fl, hw) * (.85 + .3 * fract(s * 9.0));
+    d = mix(sdRoundBox(b, ext - .08, .08), sdEllipsoid(b, ext * 1.08), .45);
+    float g = length(vec2(dot(q.xz, normalize(vec2(1.0, .8))) + .1, q.y - hw * fl)) - .045;
+    d = smax(d, -g, .03);
+  } else if (mode < 3.5) {
+    // A teardrop: flat, wide at one end and pointed at the other.
+    vec3 p = q; p.z /= mix(.5, 1.0, smoothstep(-.55, .3, q.x));
+    p.y /= mix(.6, 1.0, smoothstep(-.55, .2, q.x));
+    d = sdEllipsoid(p, vec3(.5, hw * fl, hw)) * .7;
+    if (G.x > 0.0) d += G.x * .03 * (abs(noise3(q * vec3(4.0, 9.0, 9.0) + s * 15.0) * 2.0 - 1.0) - .5);
+  } else {
+    // Flat with a pale wing around the edge, like dill.
+    d = sdEllipsoid(q, vec3(.5, hw * fl, hw));
+    d -= .012 * pow(.5 + .5 * cos(q.z / hw * PI * ridges), 3.0) * smoothstep(.45, .2, abs(q.x));
+  }
+  if (stalk > 0.0) d = smin(d, sdCapsule(q, vec3(-.45, 0.0, 0.0), vec3(-.5 - stalk * .4, 0.0, .02), .03), .03);
+  return d;
+}
+#endif
+
+#ifdef HAS_POD
+float sdPod(vec3 q, int k, float s) {
+  vec4 A = uKA[k], B = uKB[k], G = uKG[k];
+  float w = A.z, curve = A.w, segs = B.x, mode = B.y, fl = B.z > 0.0 ? B.z : 1.0;
+  float hw = w * .5, t = q.x + .5;
+  q.y -= curve * .35 * (.25 - q.x * q.x) * (fract(s * 5.0) < .5 ? 1.0 : -1.0);
+  float ang = atan(q.z, q.y);
+  float r, k2 = .7;
+  if (mode < .5) {
+    // Cardamom: pointed at both ends, three sides and fine ribs.
+    r = hw * pow(max(1.0 - 4.0 * q.x * q.x, 0.0), .55);
+    r *= 1.0 - .09 * cos(3.0 * ang + s * 6.0) - .025 * pow(.5 + .5 * cos(16.0 * ang), 3.0);
+    float d = revolved(q, r, 1.0, .75);
+    return smin(d, sdCapsule(q, vec3(-.46, 0.0, 0.0), vec3(-.56, .01, 0.0), .03), .03);
+  }
+  if (mode < 1.5) {
+    // Black cardamom: fat, with deep, uneven ribs.
+    r = hw * pow(max(1.0 - 4.0 * q.x * q.x, 0.0), .45);
+    float rib = .5 + .5 * cos(9.0 * ang + 2.2 * noise2(vec2(q.x * 4.0, s * 9.0)));
+    r *= 1.0 - .16 * pow(rib, 2.0) - .05 * noise3(q * 12.0 + s * 9.0);
+    return revolved(q, r, 1.0, .6);
+  }
+  if (mode < 2.5) {
+    // Vanilla: long, thin and flat, with a gentle twist.
+    q.y -= .015 * sin(q.x * 5.0 + s * 9.0);
+    q.yz = rot(.6 * q.x + s * 2.0) * q.yz;
+    r = hw * smoothstep(.5, .43, abs(q.x)) * (1.0 + .06 * sin(q.x * 60.0 + s * 20.0));
+    r *= 1.0 - .08 * pow(.5 + .5 * cos(7.0 * ang), 4.0);
+    return revolved(q, r + .002, .5, .7);
+  }
+  if (mode < 3.5) {
+    // Tamarind: a long pod that bulges over each seed.
+    r = hw * (.72 + .28 * abs(sin(t * segs * PI))) * smoothstep(0.0, .06, t) * smoothstep(1.0, .9, t);
+    r *= 1.0 + .06 * (noise3(q * 10.0 + s * 7.0) - .5);
+    return revolved(q, r, .7, .6);
+  }
+  // Grains of Selim: a thin pod of knobs.
+  r = hw * (.5 + .5 * pow(abs(sin(t * segs * PI)), .6)) * smoothstep(0.0, .04, t) * smoothstep(1.0, .95, t);
+  return revolved(q, r, .9, .6);
+}
+#endif
+
+#ifdef HAS_STAR
+float sdStar(vec3 q, int k, float s) {
+  float n = max(uKA[k].z, 5.0), sector = 2.0 * PI / n;
+  float a = atan(q.z, q.x);
+  float i0 = floor(a / sector + .5);
+  float best = 1e9;
+  for (int j = ZERO; j < 2; j++) {
+    float i = i0 + (j == 0 ? 0.0 : (a / sector - i0 > 0.0 ? 1.0 : -1.0));
+    vec3 p = q; p.xz = rot(i * sector) * p.xz;
+    float len = .23 * (.9 + .2 * hash12(vec2(i, s * 31.0)));
+    // A boat-shaped carpel, split open along the top
+    vec3 c = p - vec3(.27, 0.0, 0.0);
+    float rr = (len * len / .075 + .075) * .5, dd = (len * len / .075 - .075) * .5;
+    float d = sdVesica(vec2(length(vec2(c.y * 1.15, c.z)), c.x), rr, dd);
+    d = max(d, -c.y - .055);
+    float slit = max(abs(c.z) - .028 * smoothstep(.22, 0.0, abs(c.x)), -c.y + .015);
+    d = smax(d, -slit, .012);
+    best = min(best, d);
+    // The glossy seed in the opening
+    best = min(best, sdEllipsoid(c - vec3(.0, .01, 0.0), vec3(.1, .045, .04)));
+  }
+  float hub = sdCylinder(q - vec3(0.0, -.01, 0.0), .045, .07);
+  return smin(best, hub, .03);
+}
+#endif
+
+#ifdef HAS_QUILL
+float sdQuill(vec3 q, int k, float s) {
+  vec4 A = uKA[k], B = uKB[k];
+  float R = A.z, layers = A.w, th = B.x, mode = B.y;
+  float ends = abs(q.x) - .5 + .006 * noise2(vec2(q.y, q.z) * 90.0 + s * 9.0);
+  q.y -= .01 * sin(q.x * 4.0 + s * 7.0);
+  if (mode > 1.5) {
+    // A solid root stick with rough bark
+    float a = atan(q.z, q.y);
+    float d = length(q.yz) - R * (1.0 + .08 * (noise2(vec2(q.x * 30.0, a * 3.0 + s * 9.0)) - .5));
+    return max(d * .8, ends);
+  }
+  // Bark rolled into a spiral. s0 counts the turns from the outside.
+  float rho = length(q.yz), th0 = atan(q.z, q.y) + s * 6.2831;
+  float turn = fract(th0 / (2.0 * PI));
+  float gap = R * .9 / max(layers, 1.0);
+  float sn = (R - rho) / gap - turn;
+  float n = clamp(floor(sn + .5), 0.0, max(layers - 1.0, 0.0));
+  float rs = R - gap * (n + turn);
+  float d = abs(rho - rs) - th * .5;
+  return max(d * .8, ends);
+}
+#endif
+
+#ifdef HAS_CLOVE
+float sdClove(vec3 q, int k, float s) {
+  q.y -= .02 * q.x * q.x;
+  float t = clamp((q.x + .5) / .68, 0.0, 1.0);
+  float hw = mix(.032, .06, t);
+  vec2 yz = abs(q.yz) - (hw - .018);
+  float stem = max(length(max(yz, 0.0)) + min(max(yz.x, yz.y), 0.0) - .018, abs(q.x + .16) - .34);
+  float head = length(q - vec3(.34, 0.0, 0.0)) - .1;
+  float d = smin(stem, head, .03);
+  vec3 p = q - vec3(.2, 0.0, 0.0);
+  float a = atan(p.z, p.y) + s;
+  float sector = PI * .5, ia = floor(a / sector + .5) * sector - s;
+  p.yz = rot(ia) * p.yz;
+  float sep = sdEllipsoid(p - vec3(.02, .085, 0.0), vec3(.085, .03, .045));
+  return smin(d, sep, .025);
+}
+#endif
+
+#ifdef HAS_CHILI
+// The radius of a chili along its length, before the wrinkles. t runs from
+// the stalk (0) to the tip (1).
+float chiliR(float t, float R, float mode) {
+  if (mode < .5) return R * pow(1.0 - t, .8) * (.62 + .38 * smoothstep(0.0, .16, t));
+  if (mode < 1.5) return R * pow(1.0 - t, 1.05) * (.72 + .28 * smoothstep(0.0, .22, t));
+  if (mode < 2.5) return R * sqrt(max(1.0 - pow(2.0 * t - 1.0, 2.0), 0.0));
+  if (mode < 3.5) return R * pow(max(sin(PI * t), 0.0), .7) * (1.0 - .35 * t) + .02 * (1.0 - t);
+  return R * pow(1.0 - t, .6) * (.7 + .3 * smoothstep(0.0, .15, t));
+}
+float sdChili(vec3 q, int k, float s) {
+  vec4 A = uKA[k], B = uKB[k];
+  float R = A.z, wr = A.w, curve = B.x, mode = B.y, stem = B.z, fl = B.w > 0.0 ? B.w : .62;
+  float t = clamp(q.x + .5, 0.0, 1.0);
+  float bend = curve * .3 * t * t * (fract(s * 3.0) < .5 ? 1.0 : -1.0);
+  q.z -= bend;
+  float r = chiliR(t, R, mode);
+  // The slope of the profile along the chili
+  float slope = (chiliR(min(t + .004, 1.0), R, mode) - chiliR(max(t - .004, 0.0), R, mode)) / .008;
+  float ang = atan(q.z, q.y);
+  if (mode > 2.5 && mode < 3.5) r *= 1.0 + .12 * cos(4.0 * ang + s * 6.0);
+  r *= 1.0 - wr * (.11 * abs(sin(ang * 2.5 + t * 7.0 + s * 9.0)) + .1 * noise3(q * vec3(5.0, 9.0, 9.0) + s * 7.0) + .05 * abs(sin(ang * 6.0 - t * 11.0 + s * 3.0)));
+  // The flattened field divided by its gradient is close to the true
+  // distance. A plain scaled field underestimates it about 3 times, and the
+  // soft shadows then spread far from the chili.
+  float rad = length(vec2(q.y / fl, q.z));
+  float g = length(vec2(q.y / (fl * fl), q.z)) / max(rad, 1e-5);
+  float d = max((rad - r) / sqrt(g * g + slope * slope) * .72, abs(q.x) - .5);
+  // The cap and the stalk
+  float cap = sdEllipsoid(q - vec3(-.475, 0.0, 0.0), vec3(.03, R * .4 * fl, R * .4));
+  float stalk = sdCapsule(q, vec3(-.5, 0.0, 0.0), vec3(-.5 - stem * .35, .015, .03 * sin(s * 9.0)), max(R * .16, .012));
+  return min(smin(d, cap, .03), stalk);
+}
+#endif
+
+#ifdef HAS_FLAKE
+float sdFlake(vec3 q, int k, float s) {
+  float mode = uKA[k].z;
+  vec2 dir = normalize(q.xz + 1e-5);
+  float edge = noise2(dir * 1.7 + s * 37.0) - .5;
+  if (mode > .5 && mode < 1.5) {
+    // A coarse grain
+    return (length(q * vec3(1.0, 1.4, 1.1)) - .4 - .12 * (noise3(q * 4.0 + s * 9.0) - .5)) * .7;
+  }
+  if (mode > 6.5 && mode < 7.5) {
+    // A chunk of nut with broken faces
+    vec3 p = q; p.xz = rot(s * 6.0) * p.xz;
+    float d = sdRoundBox(p, vec3(.4, .26, .32) * (.8 + .4 * hash12(vec2(s, 2.0))), .1);
+    d = max(d, dot(p, normalize(vec3(.4, .8, .3))) - .18);
+    return d + .04 * (noise3(q * 6.0 + s * 9.0) - .5);
+  }
+  float aspect = mode > 1.5 && mode < 2.5 ? .55 : mode > 4.5 && mode < 5.5 ? .35 : mode > 7.5 ? .3 : .8;
+  float th = mode > 2.5 && mode < 4.5 ? .035 : mode > 1.5 && mode < 2.5 ? .05 : .025;
+  float d2 = length(q.xz * vec2(1.0, 1.0 / aspect)) - .45 * (1.0 + .5 * edge);
+  if (mode > 7.5) d2 = max(abs(q.x) - .5, abs(q.z) - .15);
+  vec3 p = q;
+  float curl = mode > 2.5 && mode < 4.5 ? .9 : .3;
+  p.y -= curl * (dot(q.xz, q.xz) - .1) * (fract(s * 11.0) - .3);
+  if (mode > 4.5 && mode < 5.5) {
+    // Mace: lacy blades with holes between the strands
+    vec2 v = voronoi(q.xz * vec2(4.0, 7.0) + s * 13.0);
+    d2 = max(d2, .06 - v.x);
+  }
+  return extrude(d2, p.y, th) * .8;
+}
+#endif
+
+#ifdef HAS_RHIZOME
+float sdRhizome(vec3 q, int k, float s) {
+  vec4 A = uKA[k];
+  float mode = A.z, rings = A.w;
+  float d;
+  if (mode < .5) {
+    d = sdCapsule(q, vec3(-.42, 0.0, 0.0), vec3(.08, .0, .05), .14);
+    d = smin(d, sdCapsule(q, vec3(0.0, 0.0, .03), vec3(.36, .03, .26), .1), .08);
+    d = smin(d, sdCapsule(q, vec3(.05, 0.0, -.04), vec3(.44, -.01, -.18), .095), .08);
+    d = smin(d, sdCapsule(q, vec3(-.3, 0.0, .05), vec3(-.3, .02, .24), .075), .07);
+  } else if (mode < 1.5) {
+    d = sdCapsule(q, vec3(-.44, 0.0, 0.0), vec3(.44, .0, .05 * sin(s * 9.0)), .095);
+    d = smin(d, sdCapsule(q, vec3(-.05, 0.0, 0.0), vec3(.15, .0, .22), .07), .05);
+  } else if (mode < 2.5) {
+    d = sdCapsule(q, vec3(-.44, 0.0, 0.0), vec3(.4, .02, .04), .15);
+    d = smin(d, sdCapsule(q, vec3(.1, 0.0, 0.0), vec3(.3, .0, .28), .1), .06);
+  } else if (mode < 3.5) {
+    float t = clamp(q.x + .5, 0.0, 1.0);
+    d = (length(q.yz) - .085 * (1.0 - .65 * t) - .01) * .8;
+    d = max(d, abs(q.x) - .5);
+  } else if (mode < 4.5) {
+    d = sdCapsule(q, vec3(-.38, 0.0, 0.0), vec3(.4, 0.0, 0.0), .17);
+    d = max(d, q.x - .44);
+    vec2 v = voronoi(vec2(q.x * 9.0, atan(q.z, q.y) * 2.2) + s * 7.0);
+    d -= .02 * smoothstep(.0, .3, v.x);
+  } else {
+    d = sdRoundBox(q, vec3(.42, .2, .26), .14);
+    d += .07 * (noise3(q * 3.0 + s * 9.0) - .5);
+  }
+  if (rings > 0.0) d += rings * .012 * pow(abs(sin(q.x * 26.0 + s * 3.0)), 10.0);
+  d += .012 * (noise3(q * 9.0 + s * 5.0) - .5);
+  // A clean cut across the thick end shows the inside.
+  if (mode < 4.5) d = max(d, -q.x - .45);
+  return d * .85;
+}
+#endif
+
+#ifdef HAS_NUTMEG
+float sdNutmeg(vec3 q, int k, float s) {
+  float d = sdEllipsoid(q, vec3(.5, .4, .4));
+  if (fract(s * 17.0) < uKH[k].y) {
+    // Mace around the seed: red straps on a thin shell
+    float shell = abs(sdEllipsoid(q, vec3(.53, .43, .43))) - .02;
+    vec2 v = voronoi(vec2(atan(q.z, q.y) * 1.3, q.x * 4.0) + s * 11.0);
+    shell = max(shell, v.x - .09);
+    d = min(d, shell);
+  }
+  return d;
+}
+#endif
+
+#ifdef HAS_THREAD
+float sdThread(vec3 q, int k, float s) {
+  float mode = uKA[k].z;
+  float t = clamp(q.x + .5, 0.0, 1.0);
+  vec2 c = vec2(.045 * sin(q.x * 4.0 + s * 9.0) + .008 * sin(q.x * 31.0 + s), .06 * sin(q.x * 3.0 + s * 5.0) + .01 * sin(q.x * 23.0 + s * 3.0));
+  vec2 yz = q.yz - c;
+  float r = mode < .5 ? .008 + .034 * pow(t, 3.0) : .008 + .005 * t;
+  float d = length(yz) - r;
+  if (mode < .5) d = max(d, -(length(yz) - r * .6 + (1.0 - smoothstep(.9, 1.0, t)) * 1.0));
+  return max(d * .8, abs(q.x) - .5);
+}
+#endif
+
+#ifdef HAS_BUD
+float sdBud(vec3 q, int k, float s) {
+  float mode = uKA[k].z;
+  if (mode < .5) {
+    float d = sdEllipsoid(q, vec3(.5, .17, .17));
+    float ang = atan(q.z, q.y);
+    d -= .012 * pow(.5 + .5 * cos(13.0 * ang), 3.0);
+    return d;
+  }
+  // A rosebud: a short stem, a small dry calyx with sepals, and petals
+  // wound tight to a point.
+  float stem = sdCapsule(q, vec3(-.5, 0.0, 0.0), vec3(-.34, .01, 0.0), .03);
+  float base = sdEllipsoid(q - vec3(-.28, 0.0, 0.0), vec3(.08, .085, .085));
+  vec3 p = q - vec3(.04, 0.0, 0.0);
+  float t = clamp((p.x + .32) / .66, 0.0, 1.0);
+  float ang = atan(p.z, p.y);
+  float r = .25 * pow(max(sin(PI * min(t * 1.15, 1.0)), 0.0), .7) * (1.0 - .55 * t * t);
+  r *= 1.0 + .04 * sin(5.0 * ang + s * 6.0);
+  float spiral = .012 * pow(abs(sin(2.5 * ang + p.x * 18.0 + s * 4.0)), 4.0);
+  float bud = (length(p.yz) - r) * .7 + spiral;
+  bud = max(bud, abs(p.x - .01) - .34);
+  // 5 sepals lie along the base of the bud.
+  float sector = 2.0 * PI / 5.0, ia = floor((ang + s) / sector + .5) * sector - s;
+  vec3 sp = p; sp.yz = rot(ia) * sp.yz;
+  float sepal = sdEllipsoid(sp - vec3(-.12, .2, 0.0), vec3(.2, .02, .045));
+  return min(stem, smin(smin(base, bud, .04), sepal, .02));
+}
+#endif
+
+#ifdef HAS_CALYX
+float sdCalyx(vec3 q, int k, float s) {
+  // A crumpled, open cup with 5 pointed lobes
+  vec3 p = q; p.yz = rot(s * 3.0) * p.yz; p.xz = rot(s * 5.0) * p.xz;
+  p += .045 * vec3(sin(p.y * 9.0 + s * 7.0), sin(p.z * 8.0 + s * 3.0), sin(p.x * 10.0 + s * 5.0));
+  float ang = atan(p.z, p.x);
+  float cone = length(p.xz) - (.1 + (p.y + .3) * .62);
+  float shell = abs(cone) * .8 - .022;
+  float lobeTop = .02 + .34 * pow(abs(cos(2.5 * ang + s * 6.0)), 2.0);
+  float d = max(max(shell, p.y - lobeTop), -p.y - .3);
+  d = min(d, length(p - vec3(0.0, -.31, 0.0)) - .085);
+  return d * .7;
+}
+#endif
+
+#ifdef HAS_TEAR
+float sdTear(vec3 q, int k, float s) {
+  float mode = uKA[k].z;
+  vec3 p = q; p.z /= mix(.6, 1.0, smoothstep(-.5, .2, q.x));
+  float d = sdEllipsoid(p, vec3(.5, .32, .36));
+  d += (mode > .5 ? .12 : .05) * (noise3(q * 3.0 + s * 19.0) - .5);
+  if (mode > .5) d = max(d, abs(dot(q, normalize(vec3(.3, 1.0, .2)))) - .26);
+  return d * .75;
+}
+#endif
+
+#ifdef HAS_LEAF
+float sdLeaf(vec3 q, int k, float s) {
+  vec4 A = uKA[k];
+  float hw = A.z * .5, curl = A.w;
+  float rr = (.25 / hw + hw) * .5, dd = (.25 / hw - hw) * .5;
+  vec3 p = q;
+  p.y -= curl * 1.2 * p.z * p.z + .12 * p.x * p.x * (fract(s * 7.0) - .5);
+  float d2 = sdVesica(vec2(p.z, p.x), rr, dd);
+  float th = .007 + .004 * smoothstep(.015, 0.0, abs(p.z));
+  float d = extrude(d2, p.y, th);
+  float petiole = sdCapsule(q, vec3(-.5, 0.0, 0.0), vec3(-.58, .01, 0.0), .01);
+  return min(d * .8, petiole);
+}
+#endif
+
+#ifdef HAS_HUSK
+float sdHusk(vec3 q, int k, float s) {
+  float best = 1e9;
+  for (int i = ZERO; i < 2; i++) {
+    float sg = i == 0 ? -1.0 : 1.0;
+    vec3 p = q - vec3(sg * .2, 0.0, 0.0);
+    p.xy = rot(sg * .55) * p.xy;
+    float shell = abs(length(p) - .27) - .035;
+    best = min(best, max(shell, p.y - .03));
+  }
+  best = min(best, sdCapsule(q, vec3(0.0, -.2, 0.0), vec3(.02, -.3, .1), .025));
+  if (fract(s * 13.0) < uKH[k].y) best = min(best, length(q - vec3(.2, -.06, 0.0)) - .15);
+  return best;
+}
+#endif
+
+#ifdef HAS_CATKIN
+float sdCatkin(vec3 q, int k, float s) {
+  float R = uKA[k].z;
+  float r = R * (.85 + .15 * smoothstep(.5, .2, abs(q.x))) * smoothstep(.5, .4, abs(q.x)) + R * .25 * (1.0 - smoothstep(.5, .4, abs(q.x)));
+  float ang = atan(q.z, q.y);
+  r += R * .07 * (.5 + .5 * sin(ang * 6.0 + q.x * 70.0)) * (.5 + .5 * sin(-ang * 5.0 + q.x * 60.0));
+  float d = revolved(q, r, 1.0, .6);
+  return min(d, sdCapsule(q, vec3(-.48, 0.0, 0.0), vec3(-.6, .01, 0.0), R * .2));
+}
+#endif
+
+float sdPiece(vec3 q, int k, float s) {
+  int f = int(uKA[k].x + .5);
+#ifdef HAS_BERRY
+  if (f == 0) return sdBerry(q, k, s);
+#endif
+#ifdef HAS_SEED
+  if (f == 1) return sdSeed(q, k, s);
+#endif
+#ifdef HAS_POD
+  if (f == 2) return sdPod(q, k, s);
+#endif
+#ifdef HAS_STAR
+  if (f == 3) return sdStar(q, k, s);
+#endif
+#ifdef HAS_QUILL
+  if (f == 4) return sdQuill(q, k, s);
+#endif
+#ifdef HAS_CLOVE
+  if (f == 5) return sdClove(q, k, s);
+#endif
+#ifdef HAS_CHILI
+  if (f == 6) return sdChili(q, k, s);
+#endif
+#ifdef HAS_FLAKE
+  if (f == 7) return sdFlake(q, k, s);
+#endif
+#ifdef HAS_RHIZOME
+  if (f == 8) return sdRhizome(q, k, s);
+#endif
+#ifdef HAS_NUTMEG
+  if (f == 9) return sdNutmeg(q, k, s);
+#endif
+#ifdef HAS_THREAD
+  if (f == 10) return sdThread(q, k, s);
+#endif
+#ifdef HAS_BUD
+  if (f == 11) return sdBud(q, k, s);
+#endif
+#ifdef HAS_CALYX
+  if (f == 12) return sdCalyx(q, k, s);
+#endif
+#ifdef HAS_TEAR
+  if (f == 13) return sdTear(q, k, s);
+#endif
+#ifdef HAS_LEAF
+  if (f == 14) return sdLeaf(q, k, s);
+#endif
+#ifdef HAS_HUSK
+  if (f == 15) return sdHusk(q, k, s);
+#endif
+#ifdef HAS_CATKIN
+  if (f == 16) return sdCatkin(q, k, s);
+#endif
+  return 1e9;
+}
+
+// The surface of a piece: its color, roughness, light through it and a bump
+// in its own frame.
+void pieceSurface(vec3 q, vec3 nl, int k, float s, out vec3 albedo, out float rough, out vec3 bump, out float sss) {
+  int f = int(uKA[k].x + .5);
+  vec4 A = uKA[k], B = uKB[k], G = uKG[k];
+  vec3 c1 = uKC[k], c2 = uKD[k];
+  float tone = .82 + .36 * fract(s * 7.13);
+  float gloss = G.y;
+  rough = mix(.72, .16, gloss);
+  sss = G.z;
+  float ang = atan(q.z, q.y);
+  vec3 n3 = vec3(noise3(q * 30.0 + s * 3.0), noise3(q * 30.0 + 4.0), noise3(q * 30.0 + 8.0)) - .5;
+  bump = n3 * .25;
+  albedo = c1;
+#ifdef HAS_BERRY
+  if (f == 0) {
+    float mode = B.z;
+    float wr = noise3(q * 7.0 + s * 17.0);
+    float crease = 1.0 - abs(wr * 2.0 - 1.0);
+    albedo = mix(c1, c2, smoothstep(.3, .9, crease) * .7) * (.85 + .3 * noise3(q * 18.0 + s));
+    bump = n3 * (.15 + G.x * .5);
+    if (A.w > 0.0) albedo = mix(c2, c1, pow(.5 + .5 * cos(A.w * ang + .6 * sin(q.x * 6.0)), 3.0));
+    if (mode > 2.5 && mode < 3.5) {
+      float star = smoothstep(.015, .0, abs(sin(atan(q.z, q.y) * 1.5)) * length(q.yz)) * smoothstep(.38, .48, q.x);
+      albedo = mix(albedo, c1 * .5, star);
+    }
+    if (mode > 3.5 && mode < 4.5) {
+      vec2 v = voronoi(vec2(ang * 4.0, q.x * 14.0) + s * 3.0);
+      bump += vec3(0.0, smoothstep(.05, .25, v.x) - .5, 0.0) * .2;
+      albedo = mix(c2, c1, .45 + .55 * noise3(q * 5.0 + s * 4.0));
+    }
+    if (mode > 4.5 && mode < 5.5) {
+      // Papery shells: pale to deep red, some with dark cracks
+      albedo = mix(c1 * 1.15, c2, fract(s * 13.7) * .65) * (.85 + .3 * smoothstep(.4, .8, noise3(q * 12.0 + s)));
+      float crack = smoothstep(.035, .0, abs(noise3(q * 6.0 + s * 21.0) - .5)) * step(.55, fract(s * 3.1));
+      albedo = mix(albedo, vec3(.06, .03, .02), crack * .85);
+    }
+    if (G.w > 0.0) {
+      float bloom = G.w * smoothstep(.25, .75, noise3(q * 9.0 + s * 4.0) * .6 + .4);
+      albedo = mix(albedo, c2 * 1.3, bloom); rough = mix(rough, .85, bloom);
+    }
+  }
+#endif
+#ifdef HAS_SEED
+  if (f == 1) {
+    float rib = B.y > 0.0 ? pow(.5 + .5 * cos(B.y * atan(q.z, q.y / max(A.w, .2))), 5.0) : 0.0;
+    albedo = mix(c1, c2, rib * .85);
+    if (B.z > 3.5) albedo = mix(c1, c2, smoothstep(-.06, -.02, sdEllipsoid(q, vec3(.5, .1, A.z * .5)) * -1.0 - .02 + .04));
+    if (B.z > 3.5) albedo = mix(c2, c1, smoothstep(A.z * .5 - .03, A.z * .5 - .09, length(q.xz * vec2(A.z, 1.0))));
+    albedo *= .88 + .24 * noise3(q * vec3(6.0, 30.0, 30.0) + s * 9.0);
+    if (G.x > .5) { float cr = abs(noise3(q * vec3(4.0, 9.0, 9.0) + s * 15.0) * 2.0 - 1.0); albedo *= mix(.55, 1.15, smoothstep(.0, .4, cr)); bump = n3 * .5; }
+  }
+#endif
+#ifdef HAS_POD
+  if (f == 2) {
+    float mode = B.y;
+    float rib = pow(.5 + .5 * cos(16.0 * ang), 3.0);
+    if (mode < .5) albedo = mix(c1, c2, rib * .6) * (.9 + .2 * noise3(q * 20.0 + s));
+    else if (mode < 1.5) albedo = mix(c1, c2, pow(.5 + .5 * cos(9.0 * ang + 2.2 * noise2(vec2(q.x * 4.0, s * 9.0))), 4.0)) * (.8 + .4 * noise3(q * 25.0));
+    else if (mode < 2.5) {
+      albedo = c1 * (.8 + .4 * noise3(q * vec3(8.0, 60.0, 60.0) + s * 5.0));
+      float frost = step(.985, hash13(floor(q * vec3(120.0, 600.0, 600.0) + s * 3.0)));
+      albedo = mix(albedo, vec3(.8, .75, .65), frost * .6);
+      bump = vec3(noise3(q * vec3(4.0, 80.0, 80.0)) - .5, 0.0, noise3(q * vec3(80.0, 4.0, 80.0)) - .5) * .35;
+    } else albedo = mix(c1, c1 * .6, smoothstep(.55, .8, noise3(q * vec3(8.0, 20.0, 20.0) + s * 3.0))) * (.85 + .3 * noise3(q * 40.0));
+  }
+#endif
+#ifdef HAS_STAR
+  if (f == 3) {
+    albedo = c1 * (.75 + .4 * noise3(q * 22.0 + s * 3.0));
+    // The seeds sit low in the open carpels and catch the light.
+    albedo = c1 * (.75 + .4 * noise3(q * 22.0 + s * 3.0));
+    float r = length(q.xz);
+    if (q.y > .0 && r > .12 && r < .42) { float a = atan(q.z, q.x); float sec = 2.0 * PI / max(A.z, 5.0); float la = a - floor(a / sec + .5) * sec; if (abs(la) * r < .03) { albedo = c2; rough = .2; } }
+  }
+#endif
+#ifdef HAS_QUILL
+  if (f == 4) {
+    float mode = B.y;
+    float lines = noise2(vec2(q.x * 6.0, ang * 30.0 + s * 9.0));
+    albedo = c1 * (.8 + .35 * lines);
+    if (mode > .5 && mode < 1.5 && length(q.yz) > A.z * .97) albedo = mix(albedo, c2 * .8 + vec3(.04), .55);
+    if (abs(q.x) > .497) albedo = mix(c1, c2, .5) * (.7 + .4 * noise2(vec2(atan(q.z, q.y) * 6.0, length(q.yz) * 150.0)));
+    if (mode > 1.5) {
+      albedo = c1 * (.7 + .5 * noise2(vec2(q.x * 20.0, ang * 8.0 + s * 9.0)));
+      if (abs(q.x) > .496) albedo = c2 * (.75 + .4 * noise2(vec2(atan(q.z, q.y) * 12.0, length(q.yz) * 200.0)));
+    }
+    bump = vec3(0.0, noise2(vec2(q.x * 4.0, ang * 40.0)) - .5, noise2(vec2(q.x * 4.0, ang * 40.0 + 9.0)) - .5) * .3;
+  }
+#endif
+#ifdef HAS_CLOVE
+  if (f == 5) {
+    float head = smoothstep(.22, .28, q.x);
+    albedo = mix(c1, c2, head) * (.8 + .35 * noise3(q * 30.0 + s));
+    rough = .6;
+  }
+#endif
+#ifdef HAS_CHILI
+  if (f == 6) {
+    float t = q.x + .5;
+    float fold = 1.0 - abs(sin(ang * 2.5 + t * 6.0 + s * 9.0));
+    albedo = c1 * mix(.7, 1.15, smoothstep(.05, .6, fold)) * (.9 + .15 * noise3(q * 20.0 + s));
+    if (t < .02 || length(q - vec3(-.475, 0.0, 0.0)) < A.z * .45) { albedo = c2 * (.55 + .3 * noise3(q * 40.0)); rough = .65; sss = 0.0; }
+    bump = vec3(noise3(q * vec3(4.0, 18.0, 18.0) + s) - .5, 0.0, noise3(q * vec3(4.0, 18.0, 18.0) + s + 5.0) - .5) * .5;
+  }
+#endif
+#ifdef HAS_FLAKE
+  if (f == 7) {
+    float mode = A.z;
+    albedo = c1 * (.8 + .4 * noise3(q * 12.0 + s * 9.0));
+    if (mode < .5 && fract(s * 23.0) < A.w) { albedo = c2; rough = .5; }
+    if (mode > 3.5 && mode < 4.5 && nl.y < 0.0) albedo = c2 * (.9 + .2 * noise3(q * 30.0));
+    if (mode > 3.5 && mode < 4.5 && nl.y >= 0.0) { vec2 v = voronoi(q.xz * 30.0); albedo *= .85 + .2 * smoothstep(0.0, .2, v.x); }
+    if (mode > 6.5 && mode < 7.5) albedo = mix(c1, c2, smoothstep(.3, .7, nl.y * .5 + .5 + .3 * (noise3(q * 8.0) - .5)));
+    if (mode > 1.5 && mode < 2.5) albedo = mix(c2, c1, smoothstep(.36, .28, length(q.xz * vec2(1.0, 1.8)))) * (.85 + .3 * noise3(q * 25.0));
+    bump = n3 * .45;
+  }
+#endif
+#ifdef HAS_RHIZOME
+  if (f == 8) {
+    float mode = A.z;
+    float ringl = pow(abs(sin(q.x * 26.0 + s * 3.0)), 10.0) * A.w;
+    albedo = c1 * (.8 + .35 * noise3(q * vec3(25.0, 10.0, 10.0) + s * 3.0)) * (1.0 - ringl * .35);
+    bump = n3 * .55;
+    // The cut faces are flat and fibrous.
+    if (mode < 4.5 && q.x < -.443) { albedo = c2 * (.9 + .12 * noise2(vec2(atan(q.z, q.y) * 40.0, length(q.yz) * 300.0))); bump = n3 * .08; }
+    if (mode > 3.5 && mode < 4.5 && q.x > .43) { albedo = c2 * (.9 + .2 * noise3(q * 60.0)); bump = n3 * .08; }
+  }
+#endif
+#ifdef HAS_NUTMEG
+  if (f == 9) {
+    vec2 v = voronoi(vec2(atan(q.z, q.y) * 2.0, q.x * 6.0) + s * 7.0);
+    albedo = mix(c2, c1, smoothstep(.02, .14, v.x)) * (.85 + .3 * noise3(q * 15.0 + s));
+    bump = vec3(0.0, smoothstep(0.0, .15, v.x) - .5, 0.0) * .3 + n3 * .2;
+    if (sdEllipsoid(q, vec3(.5, .4, .4)) > .008) { albedo = cMace * (.8 + .3 * noise3(q * 20.0)); sss = .5; rough = .45; }
+  }
+#endif
+#ifdef HAS_THREAD
+  if (f == 10) {
+    float t = q.x + .5;
+    albedo = A.z < .5 ? mix(c2, c1, smoothstep(.0, .25, t)) : mix(c1, c2, smoothstep(.3, 1.0, t));
+    albedo *= .85 + .3 * noise2(vec2(q.x * 30.0, s * 40.0));
+    rough = .45;
+  }
+#endif
+#ifdef HAS_BUD
+  if (f == 11) {
+    if (A.z < .5) {
+      albedo = mix(c1, c2, pow(.5 + .5 * cos(13.0 * ang), 3.0)) * (.85 + .3 * noise3(q * 30.0 + s));
+    } else {
+      vec3 p = q - vec3(.04, 0.0, 0.0);
+      float a2 = atan(p.z, p.y), sector = 2.0 * PI / 5.0, ia = floor((a2 + s) / sector + .5) * sector - s;
+      vec3 sp = p; sp.yz = rot(ia) * sp.yz;
+      float sepal = sdEllipsoid(sp - vec3(-.12, .2, 0.0), vec3(.2, .02, .045));
+      float green = max(1.0 - smoothstep(-.24, -.2, q.x), step(sepal, .006));
+      float petal = pow(abs(sin(2.5 * a2 + p.x * 18.0 + s * 4.0)), 4.0);
+      albedo = mix(c1 * (1.0 - petal * .4) * (1.0 + .25 * smoothstep(.1, .35, p.x)), c2 * .8, green) * (.85 + .3 * noise3(q * 20.0 + s));
+    }
+  }
+#endif
+#ifdef HAS_CALYX
+  if (f == 12) {
+    vec3 p = q; p.yz = rot(s * 3.0) * p.yz; p.xz = rot(s * 5.0) * p.xz;
+    float vein = pow(abs(sin(atan(p.z, p.x) * 15.0)), 16.0);
+    float inside = smoothstep(.0, .05, -(length(p.xz) - (.1 + (p.y + .3) * .62)));
+    albedo = mix(c1, c2, .25 + .45 * noise3(q * 7.0 + s)) * (1.0 - vein * .35) * (1.0 - inside * .35);
+    bump = n3 * .45;
+  }
+#endif
+#ifdef HAS_TEAR
+  if (f == 13) {
+    albedo = c1 * (.85 + .3 * noise3(q * 6.0 + s * 9.0));
+    if (A.z < .5) { float dust = smoothstep(.55, .75, noise3(q * 14.0 + s * 3.0)); albedo = mix(albedo, c2, dust * .6); rough = mix(rough, .7, dust); }
+    else { albedo = mix(c1, c2, smoothstep(.4, .8, noise3(q * 5.0 + s))) * (.8 + .3 * noise3(q * 25.0)); }
+  }
+#endif
+#ifdef HAS_LEAF
+  if (f == 14) {
+    float under = nl.y < 0.0 ? 1.0 : 0.0;
+    vec3 p = q;
+    float mid = smoothstep(.014, .004, abs(p.z));
+    float veins = pow(abs(sin((p.x * 1.0 - abs(p.z) * 1.6) * 26.0)), 24.0) * smoothstep(.0, .05, abs(p.z));
+    albedo = mix(c1, c2, under * .7 + mid * .6 + veins * .25) * (.85 + .3 * noise3(q * vec3(10.0, 40.0, 40.0) + s * 9.0));
+    rough = mix(.45, .7, under);
+  }
+#endif
+#ifdef HAS_HUSK
+  if (f == 15) {
+    vec2 v = voronoi(vec2(ang * 3.0, q.x * 9.0) + s * 7.0);
+    float inside = 0.0;
+    for (int i = ZERO; i < 2; i++) { float sg = i == 0 ? -1.0 : 1.0; vec3 p = q - vec3(sg * .2, 0.0, 0.0); p.xy = rot(sg * .55) * p.xy; if (length(p) < .27) inside = 1.0; }
+    albedo = mix(c1 * mix(.7, 1.1, smoothstep(.0, .25, v.x)), c2, inside);
+    bump = vec3(0.0, smoothstep(.0, .2, v.x) - .5, 0.0) * .4 * (1.0 - inside);
+    if (fract(s * 13.0) < uKH[k].y && length(q - vec3(.2, -.06, 0.0)) < .155) { albedo = vec3(.02); rough = .18; }
+  }
+#endif
+#ifdef HAS_CATKIN
+  if (f == 16) {
+    albedo = mix(c1, c2, pow(.5 + .5 * sin(ang * 6.0 + q.x * 70.0), 3.0) * .6) * (.85 + .3 * noise3(q * 30.0 + s));
+    bump = n3 * .4;
+  }
+#endif
+  albedo *= tone;
+}
+`;
+
+// The field of pieces, the heap in the bowl and the letters of the wordmark.
+// Each piece is a grid cell with a random offset, a kind, a turn and a roll.
+// The globals keep the piece that is nearest to the last map() call, so the
+// shading can find its frame again.
+const FIELD = `
+int gK; float gS, gSz, gYaw, gRoll, gTilt; vec3 gC;
+float sdLogo2D(vec2 q) {
+  vec2 px = q * uLogoInfo.z + uLogoInfo.w;
+  vec2 uv = px / uLogoInfo.xy;
+  vec2 o = max(max(-uv, uv - 1.0), 0.0) * uLogoInfo.xy / uLogoInfo.z;
+  return texture(uLogo, clamp(uv, 0.0, 1.0)).r + length(o);
+}
+// The wordmark in scene units: 0 is the center of the letters.
+float logoAt(vec2 xz) { return sdLogo2D(vec2(xz.x * uLogoK + 607.5, xz.y * uLogoK + 142.5)) / uLogoK; }
+
+int pickKind(float h) {
+  for (int i = ZERO; i < 6; i++) { if (i >= uKinds) break; if (h <= uKF[i].w) return i; }
+  return max(uKinds - 1, 0);
+}
+float heapHeight(vec2 xz) {
+  float r = length(xz - uHeap.xy) / uHeap.z;
+  return uHeap.w * pow(max(1.0 - r * r, 0.0), .55);
+}
+// Local frame of a piece: from the world to the piece, in cm.
+vec3 toLocal(vec3 p, vec3 c, float yaw, float tilt, float roll) {
+  vec3 l = p - c;
+  l.xz = rot(yaw) * l.xz;
+  l.xy = rot(tilt) * l.xy;
+  l.yz = rot(roll) * l.yz;
+  return l;
+}
+vec3 toWorld(vec3 n, float yaw, float tilt, float roll) {
+  n.yz = rot(-roll) * n.yz;
+  n.xy = rot(-tilt) * n.xy;
+  n.xz = rot(-yaw) * n.xz;
+  return n;
+}
+float restHeight(int k, float roll) {
+  float hy = uKF[k].x, hz = uKF[k].y;
+  return sqrt(hy * hy * cos(roll) * cos(roll) + hz * hz * sin(roll) * sin(roll));
+}
+float pieceDist(vec3 p, vec3 c, int k, float sz, float yaw, float tilt, float roll, float s, float best) {
+  float br = uKF[k].z * sz;
+  if (length(p - c) - br > best) return 1e9;
+  vec3 l = toLocal(p, c, yaw, tilt, roll) / sz;
+  return sdPiece(l, k, s) * sz;
+}
+float field(vec3 p) {
+  float best = 1e9;
+  vec2 cell = uField.xy;
+  float align = uField.z;
+  vec2 pxz = align > -.5 ? rot(align) * p.xz : p.xz;
+  for (int layer = ZERO; layer < 3; layer++) {
+    if (layer >= uLayers) break;
+    vec2 off = vec2(float(layer) * .37, float(layer) * .61) * cell;
+    vec2 g = (pxz + off) / cell;
+    vec2 base = floor(g) - 1.0;
+    for (int j = ZERO; j < 3; j++) for (int i = ZERO; i < 3; i++) {
+      vec2 c = base + vec2(i, j);
+      vec4 h = hash42(c + float(layer) * 31.7 + uIndex * .37);
+      vec2 cxz = (c + .5 + (h.xy - .5) * .62) * cell - off;
+      // A cheap test first: no piece of this cell can be nearer than best.
+      if (length(pxz - cxz) - uFieldMax.y > best) continue;
+      vec4 h2 = hash42(c * 1.31 + float(layer) * 7.3 + 5.0);
+      if (layer > 0 && h2.w > uField.w) continue;
+      vec2 wxz = align > -.5 ? rot(-align) * cxz : cxz;
+      int k = pickKind(h.z);
+      float sz = uKA[k].y * (.86 + .28 * h2.x);
+      if (uFieldMode == 2 && logoAt(wxz) > -sz * .15) continue;
+      float yaw = align > -.5 ? -align + (h.w - .5) * .5 : h.w * 6.2831;
+      float rmode = uKH[k].x;
+      float roll = rmode > .5 ? (h2.y < .7 ? 0.0 : PI) + (h2.z - .5) * .35 : h2.y * 6.2831;
+      float tilt = (h2.z - .5) * .3;
+      float lift = restHeight(k, roll) * sz;
+      float y = lift + float(layer) * uFieldMax.x * uKF[k].x * 1.3;
+      if (uFieldMode == 1) {
+        float rr = length(wxz - uHeap.xy);
+        if (rr > uHeap.z - sz * .45) continue;
+        y = uBowlPos.y + uHeapBase + heapHeight(wxz) - lift * .6 + float(layer) * sz * .25;
+      }
+      vec3 cen = vec3(wxz.x, y, wxz.y);
+      float s = hash12(c * 3.7 + float(layer) * 11.0);
+      float d = pieceDist(p, cen, k, sz, yaw, tilt, roll, s, best);
+      if (d < best) { best = d; gK = k; gS = s; gSz = sz; gYaw = yaw; gRoll = roll; gTilt = tilt; gC = cen; }
+    }
+  }
+  return best;
+}
+float props(vec3 p, float best) {
+  for (int i = ZERO; i < 16; i++) {
+    if (i >= uPropCount) break;
+    vec4 a = uP[i], b = uPB[i];
+    int k = int(a.w + .5);
+    float sz = uKA[k].y * b.z;
+    float lift = restHeight(k, b.y) * sz + b.x;
+    vec3 cen = vec3(a.x, lift, a.y);
+    float s = fract(float(i) * .618 + .13);
+    float d = pieceDist(p, cen, k, sz, a.z, b.w, b.y, s, best);
+    if (d < best) { best = d; gK = k; gS = s; gSz = sz; gYaw = a.z; gRoll = b.y; gTilt = b.w; gC = cen; }
+  }
+  return best;
+}
+`;
+
+// Powder: a heap, the stencil of the wordmark and the spill around a spoon.
+const POWDER = `
+float moundHeight(vec2 xz) {
+  // A cone at the angle of rest with a round top. The profile is a
+  // hyperbola, so the top has no edge, and it reaches 0 at the foot.
+  float r = length(xz - uMound.xy) / uMound.z;
+  const float c = .06;
+  float h = (sqrt(1.0 + c * c) - sqrt(r * r + c * c)) / (sqrt(1.0 + c * c) - c);
+  return uMound.w * max(h, 0.0) + uMound.w * .04 * (fbm2(xz * 1.3 / uMound.z * 6.0) - .5) * smoothstep(1.0, .5, r);
+}
+float stencilHeight(vec2 xz) {
+  float d = logoAt(xz);
+  float edge = .06 + .05 * noise2(xz * 9.0);
+  float h = uPowder.y * smoothstep(edge, -edge * 1.5, d);
+  h *= .8 + .35 * noise2(xz * 14.0) + .15 * noise2(xz * 60.0);
+  return h;
+}
+vec3 powderColor(vec2 xz, float h) {
+  float g = uPowder.x;
+  float n = noise2(xz * 90.0), n2 = noise2(xz * 260.0 + 7.0);
+  vec3 col = cGround * (.86 + .22 * n + .1 * n2);
+  if (g > .25) {
+    // Coarse grinds show specks of the whole spice.
+    vec2 cell = floor(xz * mix(60.0, 26.0, g));
+    float h1 = hash12(cell), h2 = hash12(cell + 9.1);
+    vec2 f = fract(xz * mix(60.0, 26.0, g)) - .5;
+    float dot_ = smoothstep(.42, .2, length(f + (hash22(cell) - .5) * .4));
+    int k = uKinds > 0 ? int(h2 * float(uKinds) * .999) : 0;
+    vec3 sc = uKinds > 1 ? (h1 < .5 ? uKC[k] : uKD[k]) : (h1 < .5 ? cSpeck1 : cSpeck2);
+    if (h1 < g * .9) col = mix(col, sc * (.8 + .3 * h2), dot_ * .9);
+  }
+  col = mix(col, cGround2, smoothstep(.6, .9, noise2(xz * 7.0)) * .25);
+  return col;
+}
+`;
+
+// The march, the normal, shadows and ambient occlusion, shared by the scenes.
+// Each scene defines vec2 map(vec3 p) and vec3 render(...).
+const MARCH = `
+vec2 march(vec3 ro, vec3 rd, float tmax) {
+  float t = .02 * uField.x, id = -1.0;
+  for (int i = ZERO; i < 190; i++) {
+    vec2 h = map(ro + rd * t);
+    if (h.x < .0004 * t) { id = h.y; break; }
+    t += h.x * .9;
+    if (t > tmax) break;
+  }
+  return vec2(t, id);
+}
+vec3 calcNormal(vec3 p, float t) {
+  float e = .0004 * max(t, .5);
+  vec3 n = vec3(0.0);
+  for (int i = ZERO; i < 4; i++) {
+    vec3 k = .5773 * (2.0 * vec3((((i + 3) >> 1) & 1), ((i >> 1) & 1), (i & 1)) - 1.0);
+    n += k * map(p + e * k).x;
+  }
+  return normalize(n);
+}
+float softShadow(vec3 ro, vec3 rd, float k, float scale) {
+  float res = 1.0, t = .035 * scale, ph = 1e10;
+  for (int i = ZERO; i < 36; i++) {
+    float h = map(ro + rd * t).x;
+    if (h < .0005 * scale) return 0.0;
+    float y = h * h / (2.0 * ph), d = sqrt(max(h * h - y * y, 0.0));
+    res = min(res, k * d / max(0.0, t - y));
+    if (res < .02) return 0.0;
+    ph = h; t += clamp(h, .025 * scale, .8 * scale);
+    if (t > 14.0 * scale) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+float ambientOcclusion(vec3 p, vec3 n, float scale) {
+  float occ = 0.0, sca = 1.0;
+  for (int i = ZERO; i < 4; i++) { float h = (.02 + .14 * float(i)) * scale; occ += (h - map(p + h * n).x) / scale * sca; sca *= .78; }
+  return clamp(1.0 - 2.0 * occ, 0.0, 1.0);
+}
+float windowPanes(vec3 p, vec3 key, float scale) {
+  vec3 t1 = normalize(cross(key, vec3(0.0, 0.0, 1.0))), t2 = cross(key, t1);
+  vec2 lc = vec2(dot(p, t1), dot(p, t2)) / (9.0 * scale) - vec2(.15, .1);
+  vec2 a = abs(lc);
+  float inside = (1.0 - smoothstep(.95, 1.15, a.x)) * (1.0 - smoothstep(1.2, 1.45, a.y));
+  float bars = max(1.0 - smoothstep(.02, .07, a.x), 1.0 - smoothstep(.02, .07, a.y));
+  return mix(.62, 1.0, inside * (1.0 - bars * .8));
+}
+vec3 light(vec3 p, vec3 n, vec3 rd, vec3 albedo, float rough, float f0, float metal, float sss) {
+  vec3 key = normalize(uKeyDir), rim = normalize(uRimDir), v = -rd;
+  float sh = (uDebug & 1) != 0 ? 1.0 : softShadow(p + n * .008 * uScene, key, uSoft, uScene);
+  if (uDay > .5 && (uDebug & 2) == 0) sh *= windowPanes(p, key, uScene);
+  float ao = (uDebug & 4) != 0 ? 1.0 : ambientOcclusion(p, n, uScene);
+  float nl = dot(n, key);
+  float diff = max(nl, 0.0) * sh;
+  float wrap = max((nl + sss) / (1.0 + sss), 0.0) * mix(1.0, sh, .7);
+  vec3 h = normalize(key + v);
+  float nv = max(dot(n, v), 1e-3);
+  float fr = schlick(nv, f0);
+  vec3 spec = vec3(ggx(n, h, rough) * schlick(max(dot(h, v), 0.0), f0)) * diff;
+  vec3 specCol = mix(vec3(1.0), albedo, metal);
+  float rimL = pow(max(dot(n, rim), 0.0), 2.0) * pow(1.0 - nv, 1.5);
+  vec3 col = albedo * (1.0 - metal) * (uKeyCol * mix(diff, wrap, sss > 0.0 ? 1.0 : 0.0) + uFillCol * ao * (.6 + .4 * n.y));
+  col += specCol * uKeyCol * spec;
+  col += uRimCol * rimL * ao * (.6 + .4 * (1.0 - rough));
+  // Thin, colored pieces glow when the lamp is behind them.
+  col += albedo * uKeyCol * sss * .35 * pow(max(dot(rd, key) * -1.0 + 1.0, 0.0) * .5, 3.0) * mix(.4, 1.0, sh);
+  vec3 refl = env(reflect(rd, n));
+  if ((uDebug & 8) == 0) col += refl * specCol * fr * ao * (1.0 - rough * .85) * mix(.6, 1.0, metal);
+  return col;
+}
+// A surface to light: its color, its normal and how it reflects. back adds
+// the soft glow of powder that faces away from the camera.
+struct Mat { vec3 albedo; vec3 n; float rough; float f0; float metal; float sss; float back; };
+Mat newMat(vec3 albedo, vec3 n, float rough, float f0, float metal, float sss) { Mat m; m.albedo = albedo; m.n = n; m.rough = rough; m.f0 = f0; m.metal = metal; m.sss = sss; m.back = 0.0; return m; }
+// The piece that the last map() call found
+Mat pieceMat(vec3 pos, vec3 n) {
+  vec3 l = toLocal(pos, gC, gYaw, gTilt, gRoll) / gSz;
+  vec3 nl = n; nl.xz = rot(gYaw) * nl.xz; nl.xy = rot(gTilt) * nl.xy; nl.yz = rot(gRoll) * nl.yz;
+  vec3 albedo, bump; float rough, sss;
+  pieceSurface(l, nl, gK, gS, albedo, rough, bump, sss);
+  vec3 nb = normalize(nl + bump);
+  return newMat(albedo, normalize(toWorld(nb, gYaw, gTilt, gRoll)), rough, .04, 0.0, sss);
+}
+Mat tableMat(vec3 pos, vec3 n) {
+  float rough; vec3 bump;
+  vec3 albedo = tableColor(pos, rough, bump);
+  return newMat(albedo, normalize(n + bump), rough, .035, 0.0, 0.0);
+}
+Mat powderMat(vec3 pos, vec3 n) {
+  vec3 albedo = powderColor(pos.xz + pos.y * .7, 0.0);
+  vec2 g = pos.xz * 140.0 + pos.y * 90.0;
+  vec3 b = vec3(noise2(g) - .5, 0.0, noise2(g + 3.0) - .5) + vec3(noise2(g * 2.7) - .5, 0.0, noise2(g * 2.7 + 5.0) - .5) * .6;
+  Mat m = newMat(albedo, normalize(n + b * .55), .95, .02, 0.0, .2);
+  m.back = .06;
+  return m;
+}
+Mat mixMat(Mat a, Mat b, float t) {
+  a.albedo = mix(a.albedo, b.albedo, t); a.n = normalize(mix(a.n, b.n, t)); a.rough = mix(a.rough, b.rough, t);
+  a.f0 = mix(a.f0, b.f0, t); a.sss = mix(a.sss, b.sss, t); a.back = mix(a.back, b.back, t);
+  return a;
+}
+vec3 shade(vec3 pos, vec3 rd, Mat m) {
+  vec3 col = light(pos, m.n, rd, m.albedo, m.rough, m.f0, m.metal, m.sss);
+  // Powder scatters light back toward the lamp, so grazing light looks soft.
+  return col + m.albedo * uKeyCol * m.back * pow(1.0 - max(dot(m.n, -rd), 0.0), 2.0);
+}
+`;
+
+// The camera and the accumulation of one sample.
+const MAIN = `
+void main() {
+  vec3 ro = uCamPos;
+  vec3 ww = normalize(uCamTarget - ro), uu = normalize(cross(ww, abs(ww.y) > .999 ? vec3(0, 0, -1) : vec3(0, 1, 0))), vv = cross(uu, ww);
+  float spin = hash12(gl_FragCoord.xy * .713 + 3.1) * 6.2831;
+  vec2 lens = rot(spin) * uLens;
+  vec2 jit = fract(uJitter + hash22(gl_FragCoord.xy * .291)) - .5;
+  vec2 p = (2.0 * (gl_FragCoord.xy + jit) - uRes) / uRes.y;
+  vec3 rd = normalize(p.x * uu + p.y * vv + uFocal * ww);
+  vec3 fp = ro + rd * (uFocus / dot(rd, ww));
+  ro += (uu * lens.x + vv * lens.y) * uAperture;
+  rd = normalize(fp - ro);
+  vec3 col = render(ro, rd);
+  outColor = vec4(max(col, 0.0), 1.0);
+}`;
+
+// Bowls and the wooden spoon.
+const VESSEL = `
+float sdBowl(vec3 p) {
+  vec3 q = p - uBowlPos;
+  float R = uBowl.x, H = uBowl.y, w = uBowl.z;
+  int m = int(uBowl.w + .5);
+  vec2 q2 = vec2(length(q.xz), q.y);
+  // A rounded profile: the outside, then the inside cut out
+  float outer = sdTrapezoid(vec2(q2.x, q2.y - H * .5), R * (m == 3 ? .82 : .58), R, H * .5) - .25;
+  float inner = sdTrapezoid(vec2(q2.x, q2.y - H * .5 - w * 1.4), R * (m == 3 ? .82 : .58) - w, R - w, H * .5);
+  float d = smax(outer, -(inner - .2), .4);
+  return d;
+}
+// The hollow of the bowl: negative inside it. It is open at the top, and
+// the inner wall continues above the rim, so a heap can rise above the rim.
+float bowlCavity(vec3 p) {
+  vec3 q = p - uBowlPos;
+  float R = uBowl.x, H = uBowl.y, w = uBowl.z;
+  int m = int(uBowl.w + .5);
+  float rb = R * (m == 3 ? .82 : .58), y0 = w * 1.4;
+  float wallR = mix(rb - w, R - w, (q.y - y0) / H) + .2;
+  // The wall leans out, so the radial gap overstates the distance a little.
+  return max((length(q.xz) - wallR) * .85, y0 - .2 - q.y);
+}
+vec3 bowlColor(vec3 p, out float rough, out float metal) {
+  int m = int(uBowl.w + .5);
+  metal = 0.0; rough = .2;
+  vec3 q = p - uBowlPos;
+  if (m == 0) { rough = .16 + .05 * noise2(q.xz * 3.0); return cGlaze * (.95 + .08 * fbm3(q * 2.0)); }
+  if (m == 1) {
+    float g = sin(length(q.xz) * 9.0 + fbm3(q * 1.5) * 5.0 + q.y * 2.0) * .5 + .5;
+    rough = .5;
+    return mix(vec3(.30, .17, .08), vec3(.55, .34, .17), g * .7 + .3 * noise3(q * vec3(2.0, 20.0, 2.0)));
+  }
+  if (m == 2) { metal = 1.0; rough = .26 + .1 * noise3(q * 6.0); return vec3(.78, .58, .3) * (.9 + .1 * noise3(q * 3.0)); }
+  float sp = noise3(q * 9.0), sp2 = step(.8, noise3(q * 22.0));
+  rough = .7;
+  return mix(vec3(.22, .22, .22), vec3(.5, .49, .47), sp) * (1.0 - sp2 * .5);
+}
+float sdSpoonBody(vec3 p, out float bowlDepth) {
+  vec3 q = p - vec3(uSpoon.x, 0.0, uSpoon.y);
+  q.xz = rot(uSpoon.z) * q.xz;
+  q /= uSpoon.w;
+  q.y -= .32;
+  float bowl = sdEllipsoid(q, vec3(.95, .3, .62));
+  float cut = sdEllipsoid(q - vec3(0.0, .27, 0.0), vec3(.86, .26, .53));
+  bowlDepth = cut;
+  bowl = smax(bowl, -cut, .03);
+  vec3 h = q - vec3(-.95 - 2.1, .05 + .03 * (q.x + 3.0), 0.0);
+  float handle = sdRoundBox(h, vec3(2.2, .07, .16 - .04 * (h.x / 2.2)), .06);
+  return smin(bowl, handle, .15) * uSpoon.w;
+}
+`;
+
+// ---------- scenes ----------
+
+const SCENES = {};
+
+// Whole pieces from a low angle, or a dune of the ground spice with whole
+// pieces on it for a blend.
+SCENES.whole = `
+${FIELD}
+${POWDER}
+// The table, raised where powder lies on it
+float baseHeight(vec2 xz) { return uPowder.w > .5 ? moundHeight(xz) : 0.0; }
+vec2 map(vec3 p) {
+  vec2 res = vec2((p.y - baseHeight(p.xz)) * (uPowder.w > .5 ? .6 : 1.0), 1.0);
+  if (uLayers > 0) {
+    if (length(p - uCamPos) > uFar) { float f = p.y - uFarY; if (f < res.x) res = vec2(f, 6.0); }
+    else if (p.y < uTop * 2.0) { float f = field(p); if (f < res.x) res = vec2(f, 4.0); }
+    else res.x = min(res.x, p.y - uTop);
+  }
+  float pr = props(p, res.x); if (pr < res.x) res = vec2(pr, 4.0);
+  return res;
+}
+${MARCH}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 400.0 * uScene);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  if (h.y > 5.5) {
+    // The far field: the colors of the pieces, mottled at their size
+    vec2 g = pos.xz / uField.xy;
+    float v = noise2(g * 1.7) * .6 + noise2(g * 4.3) * .4;
+    m = newMat(mix(uKC[0], uKD[0], v * .5) * (.25 + .3 * v), n, .7, .03, 0.0, 0.0);
+  }
+  else if (h.y > 3.5) { map(pos); m = pieceMat(pos, n); }
+  else m = mixMat(tableMat(pos, n), powderMat(pos, n), smoothstep(0.0, .03 * uScene, baseHeight(pos.xz)));
+  return shade(pos, rd, m);
+}
+${MAIN}`;
+
+// The wordmark in pieces on a table, or sifted through a stencil.
+SCENES.wordmark = `
+${FIELD}
+${POWDER}
+float baseHeight(vec2 xz) { return uPowder.w > 1.5 ? stencilHeight(xz) : 0.0; }
+vec2 map(vec3 p) {
+  vec2 res = vec2((p.y - baseHeight(p.xz)) * (uPowder.w > 1.5 ? .7 : 1.0), 1.0);
+  if (uLayers > 0) {
+    if (p.y < uTop * 2.0) { float f = field(p); if (f < res.x) res = vec2(f, 4.0); }
+    else res.x = min(res.x, p.y - uTop);
+  }
+  float pr = props(p, res.x); if (pr < res.x) res = vec2(pr, 4.0);
+  return res;
+}
+${MARCH}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 600.0 * uScene);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  if (h.y > 3.5) { map(pos); m = pieceMat(pos, n); }
+  else {
+    float cover = 0.0;
+    if (uPowder.w > 1.5) {
+      // The powder, and fine dust around the letters where the sieve shook it out
+      float d = logoAt(pos.xz);
+      float dust = step(.93, hash12(floor(pos.xz * 70.0))) * smoothstep(.9, .0, d) * step(0.0, d);
+      cover = max(smoothstep(0.0, uPowder.y * .2, baseHeight(pos.xz)), dust * .8);
+    }
+    m = mixMat(tableMat(pos, n), powderMat(pos, n), cover);
+  }
+  return shade(pos, rd, m);
+}
+${MAIN}`;
+
+// The spice in a bowl, with pieces on the table.
+SCENES.bowl = `
+${FIELD}
+${POWDER}
+${VESSEL}
+vec2 map(vec3 p) {
+  vec2 res = vec2(p.y, 1.0);
+  float b = sdBowl(p); if (b < res.x) res = vec2(b, 2.0);
+  float cav = bowlCavity(p) + .05;
+  if (uPowder.w > .5) {
+    // Ground spice heaped in the bowl
+    float hgt = uBowlPos.y + uHeapBase + moundHeight(p.xz - uBowlPos.xz + uMound.xy);
+    float d = max((p.y - hgt) * .6, cav);
+    if (d < res.x) res = vec2(d, 3.0);
+  }
+  if (uFieldMode == 1) {
+    // Whole pieces heaped in the bowl, on a core that fills the gaps
+    // The core of the heap sits under the pieces: deep under threads, so the
+    // gaps between them look dark, and close under flat pieces, so they do
+    // not float.
+    float depth = int(uKA[0].x + .5) == 10 ? 1.4 : uKF[0].x < .15 ? max(uKF[0].x * 2.0, .1) : .75;
+    float core = max(p.y - uBowlPos.y - uHeapBase - heapHeight(p.xz) + uKA[0].y * depth, cav);
+    if (core < res.x) res = vec2(core, 5.0);
+    if (p.y < uBowlPos.y + uHeapBase + uHeap.w + uKA[0].y * 2.0 && cav < uKA[0].y) { float f = field(p); if (f < res.x) res = vec2(f, 4.0); }
+  }
+  float pr = props(p, res.x); if (pr < res.x) res = vec2(pr, 4.0);
+  return res;
+}
+${MARCH}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 600.0 * uScene);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  if (h.y > 4.5) {
+    // The core of the heap reads as more pieces deeper in the pile: dark,
+    // mottled in the colors of the spice, and bumpy at the size of a piece.
+    vec3 g = pos / max(uKA[0].y, .2);
+    float v = noise3(g * 2.3) * .6 + noise3(g * 5.1) * .4;
+    vec3 b = vec3(noise3(g * 3.0), noise3(g * 3.0 + 4.0), noise3(g * 3.0 + 8.0)) - .5;
+    m = newMat(mix(uKC[0], uKD[0], v) * (int(uKA[0].x + .5) == 10 ? .15 : .2 + .25 * v), normalize(n + b * 1.2), .9, .02, 0.0, 0.0);
+  }
+  else if (h.y > 3.5) { map(pos); m = pieceMat(pos, n); }
+  else if (h.y > 2.5) m = powderMat(pos, n);
+  else if (h.y > 1.5) { float rough, metal; vec3 c = bowlColor(pos, rough, metal); m = newMat(c, n, rough, metal > .5 ? .9 : .05, metal, 0.0); }
+  else m = tableMat(pos, n);
+  return shade(pos, rd, m);
+}
+${MAIN}`;
+
+// A wooden spoon heaped with the ground spice, with a spill and whole pieces.
+SCENES.ground = `
+${FIELD}
+${POWDER}
+${VESSEL}
+// A thin, uneven spill of powder near the tip of the spoon.
+float spillHeight(vec2 xz) {
+  vec2 q = xz - uMound.xy;
+  float r = length(q * vec2(1.0, 1.4)) / uMound.z;
+  float edge = .45 * (fbm2(q * 1.1 + 3.0) - .5);
+  float h = uMound.w * smoothstep(1.0 + edge, .35 + edge, r);
+  return h * (.55 + .7 * noise2(xz * 2.5)) * (.85 + .3 * noise2(xz * 11.0));
+}
+vec2 map(vec3 p) {
+  vec2 res = vec2((p.y - spillHeight(p.xz)) * .75, 1.0);
+  float bd;
+  float sp = sdSpoonBody(p, bd); if (sp < res.x) res = vec2(sp, 2.0);
+  // The heap fills the hollow of the spoon and rises above its rim.
+  vec3 q = p - vec3(uSpoon.x, 0.0, uSpoon.y);
+  q.xz = rot(uSpoon.z) * q.xz;
+  q /= uSpoon.w; q.y -= .32;
+  vec2 e = q.xz / vec2(.84, .52);
+  float inside = length(e);
+  float top = .27 + .5 * pow(max(1.0 - inside * inside, 0.0), .65) + .012 * (fbm2(q.xz * 3.0) - .5);
+  float hollow = sdEllipsoid(q - vec3(0.0, .27, 0.0), vec3(.86, .26, .53));
+  float above = max(inside - 1.0, .27 - q.y);
+  float d = max((q.y - top) * .6, min(hollow, above * .5)) * uSpoon.w;
+  if (d < res.x) res = vec2(d, 3.0);
+
+  float pr = props(p, res.x); if (pr < res.x) res = vec2(pr, 4.0);
+  return res;
+}
+${MARCH}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 600.0 * uScene);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  if (h.y > 3.5) { map(pos); m = pieceMat(pos, n); }
+  else if (h.y > 2.5) m = powderMat(pos, n);
+  else if (h.y > 1.5) {
+    vec3 q = pos - vec3(uSpoon.x, 0.0, uSpoon.y); q.xz = rot(uSpoon.z) * q.xz;
+    float g = sin((q.x * 3.0 + fbm2(q.xz * vec2(.6, 3.0)) * 3.0) * 2.0) * .5 + .5;
+    vec3 wood = mix(vec3(.46, .3, .16), vec3(.68, .5, .3), g * .7 + .3 * noise2(q.xz * vec2(1.0, 30.0)));
+    m = newMat(wood, n, .5, .04, 0.0, 0.0);
+  } else {
+    // The table with the spill, and fine dust beyond its edge
+    float dust = step(.9, hash12(floor(pos.xz * 55.0))) * smoothstep(1.6, .8, length((pos.xz - uMound.xy) * vec2(1.0, 1.4)) / uMound.z);
+    float cover = max(smoothstep(0.0, uMound.w * .3, spillHeight(pos.xz)), dust * .85);
+    m = mixMat(tableMat(pos, n), powderMat(pos, n), cover);
+  }
+  return shade(pos, rd, m);
+}
+${MAIN}`;
+
+// The stencil of the wordmark from straight above, with pieces around it.
+SCENES.top = SCENES.wordmark;
+
+// ---------- the renderer ----------
+
+function program(scene, forms) {
+  // The top scene is the wordmark scene with another camera.
+  if (scene === 'top') scene = 'wordmark';
+  const key = scene + ':' + forms.join(',');
+  if (programs[key]) return programs[key];
+  const defines = forms.map(f => `#define HAS_${f.toUpperCase()} 1\n`).join('');
+  const compile = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`${scene}: ${gl.getShaderInfoLog(s)}`);
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, COMMON.replace('precision highp float;', 'precision highp float;\n' + defines) + TABLE + PIECES + SCENES[scene]));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(`${scene}: ${gl.getProgramInfoLog(prog)}`);
+  const post = gl.createProgram();
+  gl.attachShader(post, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(post, compile(gl.FRAGMENT_SHADER, POST));
+  gl.linkProgram(post);
+  if (!gl.getProgramParameter(post, gl.LINK_STATUS)) throw new Error(`post: ${gl.getProgramInfoLog(post)}`);
+  return (programs[key] = { prog, post });
+}
+
+// Tone curve, color grade, vignette and grain.
+const POST = `#version 300 es
+precision highp float;
+uniform sampler2D uAccum;
+uniform float uSamples, uDay, uSeed;
+uniform vec2 uRes;
+uniform vec3 cShadow, cHigh;
+out vec4 outColor;
+vec3 aces(vec3 x) { return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), 0.0, 1.0); }
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = texture(uAccum, uv).rgb / uSamples;
+  c = aces(c * (uDay > .5 ? 1.0 : 1.12));
+  c = pow(c, vec3(1.0 / 2.2));
+  float l = dot(c, vec3(.2126, .7152, .0722));
+  c = mix(vec3(l), c, .92);
+  c = mix(c, c * cShadow * 2.0, (1.0 - smoothstep(0.0, .45, l)) * .22);
+  c = mix(c, c * cHigh * 1.6, smoothstep(.55, 1.0, l) * .12);
+  vec2 q = uv - .5;
+  c *= 1.0 - (uDay > .5 ? .22 : .42) * pow(length(q * vec2(1.0, .8)) * 1.35, 2.4);
+  c += (hash12(gl_FragCoord.xy + uSeed) - .5) * (uDay > .5 ? .01 : .014);
+  outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
+
+function texture(w, h, internal, format, type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  return t;
+}
+
+// Halton numbers spread the samples evenly over the pixel and the lens.
+function halton(i, b) { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; }
+
+window.renderPhoto = async (opts) => {
+  const { scene, width, height, samples } = opts;
+  const P = params(opts);
+  const { prog, post } = program(scene, [...new Set(P.kinds.map(k => k.w.form))].sort());
+  canvas.width = 16; canvas.height = 16;
+  const accum = texture(width, height, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accum, 0);
+  gl.viewport(0, 0, width, height);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.useProgram(prog);
+  const u = n => gl.getUniformLocation(prog, n);
+  const set3 = (n, v) => gl.uniform3fv(u(n), v);
+  const set4 = (n, v) => gl.uniform4fv(u(n), v);
+  gl.uniform2f(u('uRes'), width, height); gl.uniform1i(u('uZero'), 0); gl.uniform1i(u('uDebug'), opts.debug || 0);
+  set3('uCamPos', P.cam.pos); set3('uCamTarget', P.cam.target);
+  gl.uniform1f(u('uFocal'), P.cam.focal); gl.uniform1f(u('uAperture'), P.cam.aperture); gl.uniform1f(u('uFocus'), P.cam.focus);
+  set3('uKeyDir', P.keyDir); set3('uKeyCol', P.keyCol); set3('uFillCol', P.fillCol); set3('uRimDir', P.rimDir); set3('uRimCol', P.rimCol);
+  gl.uniform1f(u('uDay'), P.day); gl.uniform1f(u('uSoft'), P.soft); gl.uniform1f(u('uScene'), P.scale);
+  for (const [k, v] of Object.entries(P.colors)) set3(k, v);
+  gl.uniform3fv(u('cBokeh'), P.bokeh.flat());
+  gl.uniform1f(u('uTable'), P.table); gl.uniform1f(u('uIndex'), P.index);
+  const K = P.kinds;
+  const pack = (key, n) => new Float32Array(6 * n).map((_, i) => (K[Math.floor(i / n)] ? K[Math.floor(i / n)][key][i % n] : 0));
+  gl.uniform4fv(u('uKA'), pack('A', 4)); gl.uniform4fv(u('uKB'), pack('B', 4)); gl.uniform4fv(u('uKG'), pack('G', 4));
+  gl.uniform4fv(u('uKF'), pack('F', 4)); gl.uniform4fv(u('uKH'), pack('H', 4));
+  gl.uniform3fv(u('uKC'), pack('C', 3)); gl.uniform3fv(u('uKD'), pack('D', 3));
+  gl.uniform1i(u('uKinds'), K.length);
+  set4('uField', P.field); gl.uniform1i(u('uFieldMode'), P.fieldMode); gl.uniform1i(u('uLayers'), P.layers);
+  const fk = K.filter(k => !k.big).length ? K.filter(k => !k.big) : K;
+  gl.uniform2f(u('uFieldMax'), Math.max(0, ...fk.map(k => k.A[1])) * 1.14, Math.max(0, ...fk.map(k => k.A[1] * k.F[2])) * 1.14);
+  gl.uniform1f(u('uFar'), P.far || 1e9); gl.uniform1f(u('uFarY'), P.farY || 0);
+  // A piece reaches at most its half extent above its center, and the center
+  // of a piece in a higher layer sits higher by the step of field().
+  const maxSz = Math.max(0, ...fk.map(k => k.A[1])) * 1.14;
+  const hy = Math.max(0, ...fk.map(k => k.F[0])), hm = Math.max(0, ...fk.map(k => Math.max(k.F[0], k.F[1])));
+  gl.uniform1f(u('uTop'), (maxSz * hm * 2 + Math.max(0, P.layers - 1) * maxSz * hy * 1.3) * 1.15 + maxSz * .05);
+  set4('uHeap', P.heap); gl.uniform1f(u('uHeapBase'), P.heapBase || 0);
+  gl.uniform4fv(u('uP'), new Float32Array(64).map((_, i) => (P.props[Math.floor(i / 4)] || [0, 0, 0, 0])[i % 4]));
+  gl.uniform4fv(u('uPB'), new Float32Array(64).map((_, i) => (P.propsB[Math.floor(i / 4)] || [0, 0, 1, 0])[i % 4]));
+  gl.uniform1i(u('uPropCount'), Math.min(16, P.props.length));
+  set4('uMound', P.mound); set4('uPowder', P.powder);
+  set4('uBowl', P.bowl); set3('uBowlPos', P.bowlPos); set4('uSpoon', P.spoon);
+  gl.uniform1f(u('uLogoK'), P.logoK || 20);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, logoTexture); gl.uniform1i(u('uLogo'), 1);
+  gl.activeTexture(gl.TEXTURE0);
+  if (logoInfo) gl.uniform4f(u('uLogoInfo'), logoInfo.w, logoInfo.h, logoInfo.scale, logoInfo.pad);
+
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.enable(gl.SCISSOR_TEST);
+  // Small tiles keep each draw call short. A long draw blocks the desktop
+  // compositor, and the kernel driver then resets the GPU.
+  const TILE = opts.tile || 96, SYNC = opts.sync || 2;
+  const t0 = performance.now();
+  const probe = new Float32Array(4);
+  for (let s = 0; s < samples; s++) {
+    const jx = halton(s + 1, 2) - .5, jy = halton(s + 1, 3) - .5;
+    const a = halton(s + 1, 5) * Math.PI * 2, r = Math.sqrt(halton(s + 1, 7));
+    gl.uniform2f(u('uJitter'), jx, jy);
+    gl.uniform2f(u('uLens'), Math.cos(a) * r, Math.sin(a) * r);
+    gl.uniform1f(u('uSeed'), s * 17.31);
+    let batch = 0;
+    for (let y = 0; y < height; y += TILE) for (let x = 0; x < width; x += TILE) {
+      gl.scissor(x, y, Math.min(TILE, width - x), Math.min(TILE, height - y));
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      // Reading 1 pixel waits for the GPU, so the driver gets many short jobs.
+      // gl.finish() alone lets the draws pile up into one job, and the kernel
+      // resets the GPU when a job runs longer than 5 seconds.
+      if (++batch % SYNC === 0) gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, probe);
+    }
+    if (gl.isContextLost()) throw new Error(`The GPU context was lost at sample ${s + 1}`);
+    if (opts.timing && s === 0) window.lastSampleMs = performance.now() - t0;
+    await new Promise(res => setTimeout(res, 0));
+  }
+  gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST);
+
+  // Post pass into an 8-bit target, then read back in strips.
+  const out = texture(width, height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+  const fbo2 = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo2);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, out, 0);
+  gl.useProgram(post);
+  const pu = n => gl.getUniformLocation(post, n);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, accum); gl.uniform1i(pu('uAccum'), 0);
+  gl.uniform1f(pu('uSamples'), samples); gl.uniform1f(pu('uDay'), P.day); gl.uniform1f(pu('uSeed'), P.index * 3.7);
+  gl.uniform2f(pu('uRes'), width, height);
+  gl.uniform3fv(pu('cShadow'), P.grade.shadow); gl.uniform3fv(pu('cHigh'), P.grade.high);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  const c2 = document.createElement('canvas'); c2.width = width; c2.height = height;
+  const ctx = c2.getContext('2d');
+  const STRIP = 256, buf = new Uint8Array(width * STRIP * 4);
+  for (let y = 0; y < height; y += STRIP) {
+    const h = Math.min(STRIP, height - y);
+    gl.readPixels(0, y, width, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const img = ctx.createImageData(width, h);
+    for (let row = 0; row < h; row++) img.data.set(buf.subarray(row * width * 4, (row + 1) * width * 4), (h - 1 - row) * width * 4);
+    ctx.putImageData(img, 0, height - y - h);
+  }
+  [accum, out].forEach(t => t && gl.deleteTexture(t));
+  gl.deleteFramebuffer(fbo); gl.deleteFramebuffer(fbo2);
+  return c2.toDataURL('image/jpeg', opts.quality || .9);
+};
+
+// ---------- scene parameters ----------
+
+const FORMS = ['berry', 'seed', 'pod', 'star', 'quill', 'clove', 'chili', 'flake', 'rhizome', 'nutmeg', 'thread', 'bud', 'calyx', 'tear', 'leaf', 'husk', 'catkin'];
+const MODES = {
+  berry: ['plain', 'kidney', 'crown', 'tri', 'pores', 'papery', 'sticky'],
+  seed: ['spindle', 'angular', 'box', 'teardrop', 'flat'],
+  pod: ['cardamom', 'black', 'vanilla', 'tamarind', 'selim'],
+  quill: ['cinnamon', 'cassia', 'stick'],
+  chili: ['long', 'wide', 'round', 'lantern', 'short'],
+  flake: ['chili', 'grain', 'slice', 'rind', 'peel', 'mace', 'herb', 'chunk', 'nori'],
+  rhizome: ['ginger', 'finger', 'ringed', 'taproot', 'stout', 'chunk'],
+  thread: ['saffron', 'safflower'],
+  bud: ['lavender', 'rose'],
+  tear: ['clear', 'lump'],
+};
+const mode = (w, def) => Math.max(0, (MODES[w.form] || []).indexOf(w.mode || def));
+
+// The uniforms of 1 kind: shape, material, the size of its rest pose, and
+// whether it lies flat (roll mode 1) or rolls any way (0).
+function kind(w, cum) {
+  const f = FORMS.indexOf(w.form);
+  let A = [f, w.size, 0, 0], B = [0, 0, 0, 0], hy = .5, hz = .5, bound = .6, roll = 0, cellK = 1.05, align = false;
+  if (w.form === 'berry') {
+    const e = w.elong || 1;
+    A = [f, w.size, 0, w.ribs || 0]; B = [w.tail || 0, e, mode(w, 'plain'), w.flat || 1];
+    hy = .5 / e * (w.flat || 1); hz = .5 / e; bound = .58 + (w.tail || 0) * .55; cellK = 1.1;
+    if (e > 1.2) roll = 1;
+  } else if (w.form === 'seed') {
+    const md = mode(w, 'spindle');
+    A = [f, w.size, w.w || .3, w.flat || .9]; B = [w.curve || 0, w.ridges || 0, md, w.stalk || 0];
+    hy = (w.w || .3) * .5 * (w.flat || .9); hz = (w.w || .3) * .5; bound = .6 + (w.stalk || 0) * .4; roll = md === 0 ? 0 : 1; cellK = .78;
+  } else if (w.form === 'pod') {
+    const md = mode(w, 'cardamom');
+    A = [f, w.size, w.w || .4, w.curve || 0]; B = [w.segments || 0, md, md === 2 ? .5 : md === 3 ? .7 : 1, 0];
+    hy = (w.w || .4) * .5 * (md === 2 ? .5 : md === 3 ? .7 : 1); hz = (w.w || .4) * .5; bound = .62; roll = md >= 2 ? 1 : 0;
+    cellK = md >= 2 ? 1.08 : .9; align = md >= 2;
+  } else if (w.form === 'star') {
+    A = [f, w.size, w.arms || 8, 0]; hy = .07; hz = .5; bound = .56; roll = 1; cellK = 1.0;
+  } else if (w.form === 'quill') {
+    const md = mode(w, 'cinnamon');
+    A = [f, w.size, w.r || .06, w.layers || 1]; B = [w.thick || .01, md, 0, 0];
+    hy = hz = (w.r || .06); bound = .56; roll = 0; cellK = 1.08; align = true;
+  } else if (w.form === 'clove') {
+    hy = hz = .1; bound = .56; roll = 0; cellK = .72;
+  } else if (w.form === 'chili') {
+    const md = mode(w, 'long');
+    const R = w.r || .1, fl = md === 2 ? .9 : md === 3 ? .85 : md === 1 ? .42 : .62;
+    A = [f, w.size, R, w.wrinkle || .5]; B = [w.curve || .1, md, w.stem || .3, fl];
+    hy = R * fl; hz = R; bound = .62 + (w.stem || .3) * .35; roll = 1; cellK = md >= 2 ? 1.05 : 1.02; align = md < 2 || md === 4;
+  } else if (w.form === 'flake') {
+    const md = mode(w, 'chili');
+    A = [f, w.size, md, w.seeds ?? .12];
+    hy = md === 1 ? .3 : md === 7 ? .26 : .08; hz = md === 7 ? .32 : .4; bound = .56; roll = md === 1 ? 0 : 1; cellK = md === 1 ? .9 : .8;
+  } else if (w.form === 'rhizome') {
+    const md = mode(w, 'ginger');
+    A = [f, w.size, md, w.rings || 0]; hy = md === 3 ? .09 : md === 4 ? .17 : .14; hz = md === 0 ? .3 : md === 3 ? .09 : .2; bound = .6; roll = md === 3 ? 0 : 1; cellK = 1.0;
+  } else if (w.form === 'nutmeg') {
+    A = [f, w.size, 0, 0]; hy = hz = .4; bound = .58; cellK = 1.05;
+  } else if (w.form === 'thread') {
+    A = [f, w.size, mode(w, 'saffron'), 0]; hy = hz = .05; bound = .58; cellK = .55;
+  } else if (w.form === 'bud') {
+    const md = mode(w, 'lavender');
+    A = [f, w.size, md, 0]; hy = hz = md ? .25 : .17; bound = .56; cellK = md ? .78 : .5;
+  } else if (w.form === 'calyx') {
+    hy = .32; hz = .45; bound = .62; cellK = .95;
+  } else if (w.form === 'tear') {
+    A = [f, w.size, mode(w, 'clear'), 0]; hy = .3; hz = .36; bound = .58; roll = 1; cellK = .9;
+  } else if (w.form === 'leaf') {
+    A = [f, w.size, w.w || .32, w.curl || .3]; hy = .03; hz = (w.w || .32) * .5; bound = .62; roll = 1; cellK = .72;
+  } else if (w.form === 'husk') {
+    hy = .2; hz = .45; bound = .56; roll = 1; cellK = .9;
+  } else if (w.form === 'catkin') {
+    A = [f, w.size, w.r || .13, 0]; hy = hz = (w.r || .13); bound = .62; cellK = 1.08; align = true;
+  }
+  return {
+    A, B, G: [w.wrinkle || 0, w.gloss ?? .25, w.sss || 0, w.bloom || 0], F: [hy, hz, bound, cum], H: [roll, w.mace ?? w.seeds ?? 0, 0, 0],
+    C: lin(w.color), D: lin(w.color2 || w.color), w, cellK, align,
+  };
+}
+
+// The kinds of a theme: the whole spice, or the parts of a blend.
+// Pieces longer than BIG cm stay out of the field of a blend. They lie on
+// top of the small ones as props, so the grid can stay fine.
+const BIG = 1.7;
+function kindsOf(t) {
+  const list = (t.whole ? [{ whole: t.whole, weight: 1 }] : t.mix).slice(0, 6);
+  const small = list.filter(p => p.whole.size <= BIG && !['quill', 'leaf'].includes(p.whole.form));
+  const inField = small.length ? small : list;
+  const total = inField.reduce((a, p) => a + p.weight, 0);
+  let acc = 0;
+  return list.map(p => {
+    if (inField.includes(p)) acc += p.weight;
+    const k = kind(p.whole, acc / total);
+    k.big = !inField.includes(p);
+    return k;
+  });
+}
+
+// The props: pieces placed by hand on a ring around a center, away from a
+// keep-out circle.
+// keepAt is the center of the keep-out circle, by default the center of the area.
+function scatter(r, kinds, count, cx, cz, keep, area, gap, pick, keepAt) {
+  const props = [], propsB = [];
+  const choose = pick && pick.length ? pick : kinds.map((_, i) => i);
+  const [kx, kz] = keepAt || [cx, cz];
+  for (let i = 0; i < 600 && props.length < count; i++) {
+    const x = cx + (r() - .5) * area[0], z = cz + (r() - .5) * area[1];
+    if (Math.hypot(x - kx, z - kz) < keep) continue;
+    const k = choose[Math.min(choose.length - 1, Math.floor(r() * choose.length))];
+    const sz = kinds[k].A[1];
+    if (props.some(p => Math.hypot(p[0] - x, p[1] - z) < Math.max(gap, (sz + kinds[p[3]].A[1]) * .55))) continue;
+    const roll = kinds[k].H[0] > .5 ? (r() < .75 ? 0 : Math.PI) + (r() - .5) * .3 : r() * 6.283;
+    props.push([x, z, r() * 6.283, k]);
+    propsB.push([0, roll, .9 + r() * .2, (r() - .5) * .2]);
+  }
+  return { props, propsB };
+}
+
+function params(opts) {
+  const t = opts.theme, c = t.colors, day = c.mode === 'light';
+  const r = rng(t.index * 7919 + (day ? 3 : 0) + opts.scene.length * 101);
+  const accent = lin(c.accent), second = lin(t.second);
+  const tableKinds = day ? [2, 3, 4] : [0, 1, 0];
+  const table = tableKinds[t.index % 3];
+  const walnut = '#3a2416', oak = '#c8a476';
+  let tableA, tableB;
+  if (table === 0) { tableA = mix(c.darker_background, walnut, .6); tableB = mix(c.background, '#5a3a24', .5); }
+  else if (table === 1) { tableA = mix(c.darker_background, '#1c1e20', .55); tableB = mix(c.background, '#34363a', .55); }
+  else if (table === 2) { tableA = mix(c.background, '#ffffff', .65); tableB = mix(mix(c.muted, '#8a8580', .5), c.accent, .1); }
+  else if (table === 3) { tableA = mix(c.background, '#ffffff', .3); tableB = mix(c.background, c.muted, .3); }
+  else { tableA = mix(c.background, oak, .4); tableB = mix(c.background, '#ffffff', .45); }
+  const glaze = day ? mix('#f7f3ee', c.accent, .08) : mix(mix(c.background, c.foreground, .22), c.accent, .14);
+  const warm = [1.0, .84, .66], daylight = [1.0, .98, .95];
+  const kinds = kindsOf(t);
+  const P = {
+    day: day ? 1 : 0, index: t.index, table, scale: 1,
+    soft: day ? 6 : 12,
+    keyDir: day ? [-.6, .85, .5] : [-.85, .5, -.3],
+    keyCol: day ? daylight.map(v => v * 2.3) : warm.map(v => v * 2.6),
+    fillCol: day ? [.36, .37, .40] : lin(c.background).map(v => v * 1.2 + .01),
+    rimDir: day ? [.6, .4, -.7] : [.75, .45, -.55],
+    rimCol: day ? [.12, .12, .12] : accent.map(v => v * .6),
+    colors: {
+      cBg: lin(c.background), cDark: lin(c.darker_background), cGlaze: lin(glaze), cTableA: lin(tableA), cTableB: lin(tableB),
+      cGround: lin(t.ground), cGround2: lin(mix(t.ground, '#000000', .25)), cMace: lin('#b8361d'),
+      cSpeck1: lin(t.whole ? t.whole.color : t.ground), cSpeck2: lin(mix(t.whole ? (t.whole.color2 || t.ground) : t.ground, '#efe6d2', .45)),
+    },
+    bokeh: [c.accent, t.second, '#ffd8a0', '#ffe9c9', t.ansi[3], t.ansi[11]].map(h => lin(h || '#ffd8a0')),
+    grade: { shadow: lin(mix(c.darker_background, '#808080', .5)), high: lin(mix(c.accent, '#ffffff', .7)) },
+    kinds, field: [1, 1, -1, .5], fieldMode: 0, layers: 0, heap: [0, 0, 1, 1],
+    props: [], propsB: [], mound: [0, 0, 1, 0], powder: [t.grind, 0, 0, 0],
+    bowl: [6, 4, .5, 0], bowlPos: [0, 0, 0], spoon: [0, 0, 0, 0],
+    cam: { pos: [0, 2.4, 9.5], target: [0, .2, 0], focal: 2.2, aperture: .14, focus: 9.3 },
+  };
+  const look = (pos, target, focal, aperture) => ({ pos, target, focal, aperture, focus: Math.hypot(...pos.map((v, i) => v - target[i])) });
+  const main = kinds[0], size = main ? main.A[1] : 1;
+  const maxSize = Math.max(...kinds.map(k => k.A[1]), .3);
+  // The cell of the field. Long pieces lie side by side in an aligned field.
+  const fieldKinds = kinds.filter(k => !k.big);
+  const setField = (k, dense = 1) => {
+    const w = k.w, sz = Math.max(...fieldKinds.map(kk => kk.A[1]));
+    if (k.align) {
+      const across = Math.max(k.F[1], .04) * 2 * sz * (w.form === 'chili' ? 1.2 : 1.9);
+      P.field = [sz * k.cellK, across * dense, r() * 6.283, .55];
+    } else {
+      const cs = sz * k.cellK * dense;
+      P.field = [cs, cs, -1, w.form === 'thread' || w.form === 'leaf' ? .9 : .55];
+    }
+    P.layers = w.form === 'thread' || w.form === 'leaf' || w.form === 'seed' || w.form === 'bud' ? 3 : 2;
+  };
+  const isPowder = !t.whole && !t.coarse;
+
+  if (opts.scene === 'whole') {
+    if (!t.whole && !t.mix.length || (!t.whole && t.mix.length === 1)) {
+      // A dune of the ground spice
+      P.powder[3] = 1; P.mound = [0, -1, 7.5, 5.2];
+      P.scale = 1.4;
+      P.cam = look([0, 6.5 + r() * .5, 16], [(r() - .5) * 1.5, 2.2, -1], 2.4, .3);
+      if (day) { P.keyDir = [-.5, 1.0, .35]; P.table = 4; }
+    } else if (!t.whole) {
+      // A blend: its small parts cover the table, and its large parts lie on top.
+      const small = fieldKinds[0];
+      setField(small, .95);
+      P.layers = 2;
+      const sz = Math.max(...fieldKinds.map(k => k.A[1]));
+      const frame = Math.max(sz * 8, 5.5);
+      P.scale = frame / 10;
+      const D = frame * .72;
+      const bigIdx = kinds.map((k, i) => (k.big ? i : -1)).filter(i => i >= 0);
+      if (bigIdx.length) {
+        const s = scatter(r, kinds, 5, 0, -frame * .2, 0, [frame * 1.1, frame * .7], frame * .18, bigIdx);
+        s.propsB.forEach(b => { b[0] = sz * .9; });
+        P.props = s.props; P.propsB = s.propsB;
+      }
+      P.cam = look([0, D * .34, D * .95], [(r() - .5) * frame * .1, sz * .2, 0], 2.4, frame * .014);
+      if (day) { P.keyDir = [-.5, 1.0, .35]; P.table = 4; }
+    } else {
+      setField(main);
+      const f = main.w.form, sz = maxSize;
+      let frame;
+      if (main.align) frame = sz * (f === 'quill' ? 1.05 : f === 'pod' && sz > 6 ? 1.0 : 1.6);
+      else if (f === 'rhizome' || f === 'leaf') frame = sz * 1.7;
+      else if (f === 'thread') frame = sz * 2.4;
+      else if (f === 'chili') frame = sz * 3.2;
+      else frame = sz * Math.min(9, Math.max(3.6, 9 - sz * 1.3));
+      P.scale = frame / 10;
+      const D = frame * .72;
+      const lift = main.F[0] * sz, pileTop = lift * (2 + 1.3 * (P.layers - 1));
+      const camY = Math.max(D * (main.align ? .5 : .34), pileTop * 1.9);
+      // The camera looks down at about 19 degrees, so the top of the frame shows
+      // the room behind the pile.
+      P.cam = look([0, camY, D * .95], [(r() - .5) * frame * .1, Math.max(camY - D * .33, pileTop * .3), 0], 2.4, frame * .014);
+      P.far = P.cam.focus * 2.2; P.farY = lift * 1.6;
+      // Long pieces run across the view at an angle.
+      if (main.align) P.field[2] = (r() < .5 ? 1 : -1) * (.3 + r() * .35);
+      if (day) { P.keyDir = [-.5, 1.0, .35]; P.table = 4; }
+    }
+  } else if (opts.scene === 'wordmark' || opts.scene === 'top') {
+    const top = opts.scene === 'top';
+    const stencil = t.word === 'stencil' || top;
+    // The wordmark is 1215 logo units wide.
+    let width = stencil ? 46 : Math.min(120, Math.max(16, maxSize * 46));
+    P.logoK = 1215 / width;
+    P.scale = width / 58;
+    if (stencil) {
+      P.powder = [t.grind, .22 + t.grind * .12, 0, 2];
+      // Props lie in a band above and below the letters, never on them.
+      const props = [], propsB = [];
+      for (let i = 0; i < 400 && props.length < (top ? 9 : 8); i++) {
+        const x = (r() - .5) * width * (top ? 1.3 : 1.45), z = (r() - .5) * width * (top ? .72 : .85);
+        if (Math.abs(x) < width * .56 && Math.abs(z) < width * .2) continue;
+        const k = Math.floor(r() * kinds.length);
+        if (props.some(p => Math.hypot(p[0] - x, p[1] - z) < Math.max(width * .07, kinds[k].A[1] * .7))) continue;
+        props.push([x, z, r() * 6.283, k]);
+        propsB.push([0, kinds[k].H[0] > .5 ? (r() < .75 ? 0 : Math.PI) : r() * 6.283, .9 + r() * .2, (r() - .5) * .2]);
+      }
+      P.props = props; P.propsB = propsB;
+    } else {
+      setField(main, .82);
+      P.fieldMode = 2;
+      P.layers = 2;
+      P.field[3] = .5;
+    }
+    if (top) {
+      const focal = 3.0, height = width * 1.5 * focal / (3840 / 2160) / 2;
+      P.cam = { pos: [0, height, .001], target: [0, 0, 0], focal, aperture: 0, focus: height };
+      P.keyDir = day ? [-.55, .9, .35] : [-.7, .62, -.25];
+    } else {
+      P.cam = look([0, 33 * P.scale, 25.5 * P.scale], [0, 0, 1.2 * P.scale], 2.15, .3 * P.scale);
+      P.keyDir = day ? [-.55, .85, .45] : [-.8, .55, -.25];
+    }
+  } else if (opts.scene === 'bowl') {
+    // Flat pieces of 2.5 cm or more do not pile well, so they rest on a heap
+    // of the ground spice instead.
+    const flat = k => k.F[0] < .12 && k.F[1] > 2.5 * k.F[0] && !k.align;
+    const flatBig = kinds.some(k => flat(k) && k.A[1] >= 2.5);
+    const small = !isPowder && kinds.length && maxSize <= 3.2 && kinds.every(k => !k.align) && !flatBig;
+    const R = 6.2, H = 4.2, wall = .45, mat = [0, 1, 2, 3][t.index % 4];
+    P.bowl = [R, H, wall, mat]; P.bowlPos = [0, 0, 0];
+    P.scale = 1.6;
+    // The heap starts at 3/4 of the height. The hollow there is this wide.
+    const base = H * .74, bottom = R * (mat === 3 ? .82 : .58);
+    const heapR = bottom + (R - bottom) * (base / H) - wall - .25;
+    P.heapBase = base;
+    if (small) {
+      P.fieldMode = 1;
+      setField(main);
+      P.layers = ['flake', 'thread', 'leaf', 'seed', 'bud', 'clove', 'husk', 'star'].includes(main.w.form) ? 3 : 2;
+      if (main.w.form === 'star') setField(main, .85), P.layers = 3;
+      P.heap = [0, 0, heapR, Math.min(H * .45, heapR * .5)];
+      const s = scatter(r, kinds, 9, -3.5, -3, R + 1.6, [24, 12], maxSize * 1.6, null, [0, 0]);
+      P.props = s.props; P.propsB = s.propsB;
+    } else {
+      P.powder = [t.grind, 0, 0, 1]; P.mound = [0, 0, heapR + .2, Math.min(2.4, heapR * .5)];
+      if (kinds.length) {
+        const s = scatter(r, kinds, Math.min(7, kinds.length * 3), -3.5, -3.5, R + 1.2 + maxSize * .25, [24 + maxSize * .3, 11 + maxSize * .2], maxSize * .6, null, [0, 0]);
+        P.props = s.props; P.propsB = s.propsB;
+        // Up to 3 pieces rest on the heap near the top, sunk a little into the
+        // powder. Long pieces would hang over the rim, so they stay on the table.
+        const onHeap = kinds.map((k, i) => i).filter(i => !kinds[i].align && (kinds[i].A[1] <= 4.5 || (flat(kinds[i]) && kinds[i].A[1] <= 8)));
+        if (onHeap.length) {
+          const [mx, mz, mR, mH] = P.mound, c = .06, top = Math.sqrt(1 + c * c);
+          const heapAt = (x, z) => mH * Math.max(0, (top - Math.sqrt((Math.hypot(x - mx, z - mz) / mR) ** 2 + c * c)) / (top - c));
+          for (let i = 0; i < 3; i++) {
+            const a = r() * 6.283 + i * 2.1, d = mR * (.15 + .25 * r());
+            const x = Math.cos(a) * d, z = Math.sin(a) * d;
+            P.props.unshift([x, z, r() * 6.283, onHeap[i % onHeap.length]]);
+            P.propsB.unshift([base + heapAt(x, z) - .15, 0, .95 + r() * .1, (r() - .5) * .5]);
+          }
+          P.props = P.props.slice(0, 16); P.propsB = P.propsB.slice(0, 16);
+        }
+      }
+    }
+    P.cam = look([-1.5, 17.5, 17.5], [-3.6, 1.6, .6], 2.5, day ? .26 : .3);
+    if (day) P.keyDir = [-.65, .9, .35];
+  } else if (opts.scene === 'ground') {
+    const w = 3.0, a = -.38 + (r() - .5) * .3;
+    P.spoon = [1.2, .4, a, w];
+    // The spill lies past the tip of the spoon.
+    const ca = Math.cos(a), sa = Math.sin(a), tip = [1.2 + ca * 1.25 * w, .4 + sa * 1.25 * w];
+    P.mound = [tip[0] + 1.2, tip[1] - .6, 2.6, .12];
+    P.powder = [t.grind, 0, 1, 3];
+    P.scale = 1.1;
+    if (kinds.length) {
+      const s = scatter(r, kinds, Math.min(7, 2 + kinds.length * 2), -1, -3, 5.2 + maxSize * .2, [24 + maxSize * .6, 11 + maxSize * .3], maxSize * .5, null, [1.5, .4]);
+      P.props = s.props; P.propsB = s.propsB;
+    }
+    P.cam = look([-3.2, 10.5, 12.5], [.6, .9, .2], 2.7, .3);
+    P.keyDir = day ? [-.55, .95, .3] : [-.75, .55, -.35];
+  }
+  // A test can look from another place: [pos, target, focal, aperture].
+  if (opts.cam) P.cam = look(...opts.cam);
+  return P;
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,353 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Spice card renderer</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// The profile card of each spice. tools/render.mjs loads this page in
+// headless Chromium and calls window.renderImage() for each image. All
+// drawing uses a 3840x2160 design space. S scales the design space to the
+// output size, and blur radii scale with S, so every size looks the same.
+//
+// The card shows the name, the description, the botanical name, the part of
+// the plant, the flavor notes, the heat, and the colors of the whole and the
+// ground spice. A chili card adds the Scoville scale. A blend card lists the
+// parts of the blend.
+//
+// tools/photo.html renders the other backgrounds as photographs.
+
+const W = 3840, H = 2160;
+const MONO = '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace';
+const SERIF = '"Noto Serif", serif';
+let LOGO = [];
+let S = 1;
+
+window.setLogo = paths => { LOGO = paths.map(p => ({ path: new Path2D(p.d), rule: p.evenodd ? 'evenodd' : 'nonzero' })); };
+
+// ---------- helpers ----------
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function rgb(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function rgba(hex, a) { const [r, g, b] = rgb(hex); return `rgba(${r},${g},${b},${a})`; }
+function mix(a, b, t) {
+  const pa = rgb(a), pb = rgb(b);
+  return '#' + pa.map((v, i) => Math.round(v * (1 - t) + pb[i] * t).toString(16).padStart(2, '0')).join('');
+}
+function lum(hex) { const [r, g, b] = rgb(hex); return (.2126 * r + .7152 * g + .0722 * b) / 255; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function smooth(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+
+// Canvas blur ignores the transform, so the radius scales with S.
+const blur = r => `blur(${(r * S).toFixed(1)}px)`;
+
+// Seeded 2D gradient noise.
+function makeNoise(seed) {
+  const r = rng(seed), perm = new Uint8Array(512), grad = [];
+  const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  for (let i = 0; i < 256; i++) { const a = r() * Math.PI * 2; grad.push([Math.cos(a), Math.sin(a)]); }
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  function n(x, y) {
+    const x0 = Math.floor(x), y0 = Math.floor(y), sx = fade(x - x0), sy = fade(y - y0);
+    const X = x0 & 255, Y = y0 & 255, fx = x - x0, fy = y - y0;
+    const d = (dx, dy) => { const g = grad[perm[((X + dx) & 255) + perm[(Y + dy) & 255]]]; return g[0] * (fx - dx) + g[1] * (fy - dy); };
+    return lerp(lerp(d(0, 0), d(1, 0), sx), lerp(d(0, 1), d(1, 1), sx), sy);
+  }
+  n.fbm = (x, y, oct = 5) => { let s = 0, a = .5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f, y * f); a *= .5; f *= 2; } return s; };
+  return n;
+}
+
+// Fills the design space from a per-pixel function at a lower resolution.
+// fn(x, y) gets design coordinates and returns [r, g, b].
+function pixels(ctx, fn, width = 1600) {
+  const tw = Math.min(width, Math.round(W * S)), th = Math.round(tw * H / W);
+  const cv = document.createElement('canvas'); cv.width = tw; cv.height = th;
+  const cx = cv.getContext('2d'), img = cx.createImageData(tw, th), d = img.data;
+  for (let j = 0, i = 0; j < th; j++) {
+    const y = (j + .5) * H / th;
+    for (let k = 0; k < tw; k++, i += 4) {
+      const c = fn((k + .5) * W / tw, y);
+      d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = 255;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+  ctx.save(); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(cv, 0, 0, W, H); ctx.restore();
+}
+
+// Interpolates a list of hex colors at t from 0 to 1, as [r, g, b].
+function ramp(stops, t) {
+  t = clamp(t, 0, 1) * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(t)), f = t - i;
+  const a = stops[i], b = stops[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+
+function vignette(ctx, P, amount) {
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * .35, W / 2, H / 2, W * .62);
+  const c = P.light ? P.c[8] : P.darker;
+  g.addColorStop(0, rgba(c, 0)); g.addColorStop(1, rgba(c, amount ?? (P.light ? .22 : .55)));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+// Fine grain hides gradient banding after JPEG compression.
+function grain(ctx, seed, alpha = .05) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 256;
+  const gx = cv.getContext('2d'), r = rng(seed), img = gx.createImageData(256, 256);
+  for (let i = 0; i < img.data.length; i += 4) { const v = r() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+  gx.putImageData(img, 0, 0);
+  ctx.save();
+  ctx.globalAlpha = alpha; ctx.globalCompositeOperation = 'overlay';
+  const pattern = ctx.createPattern(cv, 'repeat');
+  pattern.setTransform(new DOMMatrix().scale(1 / S));
+  ctx.fillStyle = pattern; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// Draws a shape with a soft shadow below and to the right, as if the light
+// comes from the top left.
+// A soft ellipse that fades out at the edge. It replaces a blur filter, which
+// is slow on a 6K canvas when it runs hundreds of times.
+function softEllipse(ctx, x, y, rx, ry, rot, color, alpha) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(rx, ry);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+  g.addColorStop(0, rgba(color, alpha)); g.addColorStop(.55, rgba(color, alpha * .75)); g.addColorStop(1, rgba(color, 0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 1, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function circle(ctx, x, y, r) { ctx.beginPath(); ctx.arc(x, y, Math.max(0, r), 0, Math.PI * 2); }
+
+function text(ctx, str, x, y, size, color, { font = MONO, weight = '', align = 'left', spacing = 0, alpha = 1, baseline = 'alphabetic', italic = false } = {}) {
+  ctx.save();
+  ctx.font = `${italic ? 'italic ' : ''}${weight} ${size}px ${font}`;
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = baseline; ctx.globalAlpha = alpha;
+  if (spacing) ctx.letterSpacing = `${spacing}px`;
+  ctx.fillText(str, x, y);
+  const w = ctx.measureText(str).width;
+  ctx.restore();
+  return w;
+}
+
+// ---------- the card ----------
+
+function wrap(ctx, str, font, width) {
+  const words = str.split(' '), lines = [];
+  let line = '';
+  ctx.save(); ctx.font = font;
+  for (const wd of words) { const t = line ? `${line} ${wd}` : wd; if (ctx.measureText(t).width > width && line) { lines.push(line); line = wd; } else line = t; }
+  ctx.restore();
+  lines.push(line);
+  return lines;
+}
+
+// The left column: the category, the name and the description.
+function titleBlock(ctx, P, x, y) {
+  const label = `${P.category.toUpperCase()}  ·  ${String(P.index).padStart(2, '0')} / ${P.total}`;
+  text(ctx, label, x, y, 40, P.c[8], { spacing: 8 });
+  let size = 230;
+  ctx.save(); ctx.font = `300 ${size}px ${SERIF}`; const w = ctx.measureText(P.base).width; ctx.restore();
+  if (w > 1500) size = Math.floor(size * 1500 / w);
+  text(ctx, P.base, x - 8, y + 40 + size, size, P.fg, { font: SERIF, weight: '300' });
+  ctx.fillStyle = P.accent; ctx.fillRect(x, y + 120 + size, 140, 8);
+  const lines = wrap(ctx, P.desc, `52px ${MONO}`, 1420);
+  lines.forEach((l, i) => text(ctx, l, x, y + 260 + size + i * 74, 52, P.dfg));
+  return y + 260 + size + lines.length * 74;
+}
+
+function chip(ctx, P, x, y, label) {
+  ctx.save(); ctx.font = `44px ${MONO}`; const w = ctx.measureText(label).width + 64; ctx.restore();
+  ctx.fillStyle = rgba(P.accent, P.light ? .1 : .12); ctx.beginPath(); ctx.roundRect(x, y, w, 86, 43); ctx.fill();
+  ctx.strokeStyle = rgba(P.accent, .55); ctx.lineWidth = 3; ctx.stroke();
+  text(ctx, label, x + 32, y + 58, 44, P.fg);
+  return w;
+}
+
+function paperBase(ctx, P, noise) {
+  ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+  pixels(ctx, (x, y) => {
+    const v = noise.fbm(x * .003, y * .003, 3) * .5 + noise(x * .08, y * .08) * .2;
+    return rgb(P.bg).map(ch => ch * (1 + v * (P.light ? .03 : .08)));
+  }, 1400);
+  // Dot grid
+  ctx.fillStyle = rgba(P.c[8], P.light ? .22 : .18);
+  for (let y = 90; y < H; y += 90) for (let x = 90; x < W; x += 90) ctx.fillRect(x - 3, y - 3, 6, 6);
+}
+
+function heading(ctx, P, x, y, label) { text(ctx, label.toUpperCase(), x, y, 34, P.c[8], { spacing: 7 }); }
+
+// Small line drawings for each part of a plant. Each draws around 0,0 in a
+// box of about 110 by 110.
+const PART_ICONS = {
+  seed(c) { c.beginPath(); c.ellipse(0, 0, 30, 46, .5, 0, Math.PI * 2); c.stroke(); c.beginPath(); c.moveTo(-12, -24); c.quadraticCurveTo(4, 0, 12, 24); c.stroke(); },
+  fruit(c) { c.beginPath(); c.arc(0, 10, 38, 0, Math.PI * 2); c.stroke(); c.beginPath(); c.moveTo(0, -28); c.lineTo(4, -50); c.stroke(); c.beginPath(); c.ellipse(20, -46, 18, 8, -.4, 0, Math.PI * 2); c.stroke(); },
+  pod(c) { c.beginPath(); c.moveTo(-52, 20); c.bezierCurveTo(-30, -36, 30, -36, 52, -20); c.bezierCurveTo(30, 20, -30, 38, -52, 20); c.stroke(); for (const x of [-20, 4, 26]) { c.beginPath(); c.arc(x, -2 - x * .25, 7, 0, Math.PI * 2); c.stroke(); } },
+  bark(c) { c.beginPath(); for (let a = 0; a < 11; a += .1) { const r = 6 + a * 3.6; c.lineTo(Math.cos(a) * r * .55 - 20, Math.sin(a) * r); } c.stroke(); c.beginPath(); c.moveTo(-20, -40); c.lineTo(46, -40); c.moveTo(-20, 40); c.lineTo(46, 40); c.moveTo(46, -40); c.ellipse(46, 0, 12, 40, 0, -Math.PI / 2, Math.PI / 2); c.stroke(); },
+  root(c) { c.beginPath(); c.moveTo(-50, -10); c.bezierCurveTo(-30, -40, 10, -30, 20, -10); c.bezierCurveTo(40, -24, 56, -6, 46, 10); c.bezierCurveTo(30, 24, 0, 30, -20, 20); c.bezierCurveTo(-40, 26, -60, 10, -50, -10); c.stroke(); for (const x of [-30, -6, 18]) { c.beginPath(); c.moveTo(x, 22); c.lineTo(x - 6, 46); c.stroke(); } },
+  flower(c) { for (let i = 0; i < 5; i++) { c.save(); c.rotate(i * Math.PI * 2 / 5); c.beginPath(); c.ellipse(0, -28, 15, 24, 0, 0, Math.PI * 2); c.stroke(); c.restore(); } c.beginPath(); c.arc(0, 0, 9, 0, Math.PI * 2); c.stroke(); },
+  leaf(c) { c.beginPath(); c.moveTo(-52, 30); c.bezierCurveTo(-30, -30, 30, -46, 52, -36); c.bezierCurveTo(40, 0, 0, 40, -52, 30); c.stroke(); c.beginPath(); c.moveTo(-52, 30); c.quadraticCurveTo(0, 0, 50, -34); c.stroke(); },
+  resin(c) { c.beginPath(); c.moveTo(0, -48); c.bezierCurveTo(20, -14, 38, 6, 38, 20); c.arc(0, 20, 38, 0, Math.PI); c.bezierCurveTo(-38, 6, -20, -14, 0, -48); c.stroke(); c.beginPath(); c.arc(-12, 18, 8, 0, Math.PI * 2); c.stroke(); },
+};
+const PART_OF = {
+  'Seed': 'seed', 'Seed kernel': 'seed', 'Aril': 'seed', 'Fruit': 'fruit', 'Seed cone': 'fruit', 'Fruit husk': 'fruit', 'Fruit peel': 'fruit',
+  'Fruit rind': 'fruit', 'Fruit pod': 'pod', 'Fruit spike': 'pod', 'Inner bark': 'bark', 'Bark': 'bark', 'Rhizome': 'root', 'Root': 'root',
+  'Stigma': 'flower', 'Flower': 'flower', 'Flower bud': 'flower', 'Floret': 'flower', 'Calyx': 'flower', 'Pollen': 'flower', 'Leaf': 'leaf', 'Resin': 'resin',
+};
+
+function partRow(ctx, P, x, y) {
+  heading(ctx, P, x, y, 'Part of the plant');
+  const on = PART_OF[P.part];
+  const keys = Object.keys(PART_ICONS);
+  keys.forEach((k, i) => {
+    const cx = x + 80 + i * 182, cy = y + 150, active = k === on;
+    ctx.save(); ctx.translate(cx, cy);
+    if (active) { ctx.fillStyle = rgba(P.accent, P.light ? .14 : .16); circle(ctx, 0, 0, 82); ctx.fill(); ctx.strokeStyle = P.accent; ctx.lineWidth = 4; circle(ctx, 0, 0, 82); ctx.stroke(); }
+    ctx.strokeStyle = active ? P.fg : rgba(P.c[8], .8); ctx.lineWidth = active ? 6 : 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    PART_ICONS[k](ctx);
+    ctx.restore();
+    text(ctx, k, cx, cy + 140, 34, active ? P.fg : P.c[8], { align: 'center' });
+  });
+  return y + 360;
+}
+
+function notesRow(ctx, P, x, y) {
+  heading(ctx, P, x, y, 'Flavor');
+  let cx = x;
+  P.notes.forEach((n, i) => {
+    const w = text(ctx, n, cx, y + 120, 84, P.fg, { font: SERIF, italic: true });
+    cx += w + 40;
+    if (i < P.notes.length - 1) { ctx.fillStyle = P.accent; circle(ctx, cx, y + 92, 9); ctx.fill(); cx += 50; }
+  });
+  return y + 230;
+}
+
+// Heat from 0 to 5 as 5 small chilies.
+function heatRow(ctx, P, x, y) {
+  heading(ctx, P, x, y, 'Heat');
+  for (let i = 0; i < 5; i++) {
+    const cx = x + 60 + i * 120, cy = y + 90, on = i < P.heat;
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(-.5);
+    ctx.beginPath(); ctx.moveTo(-40, -6); ctx.bezierCurveTo(-20, -24, 30, -16, 46, 14); ctx.bezierCurveTo(20, 6, -10, 14, -40, 10); ctx.closePath();
+    ctx.fillStyle = on ? P.c[1] : rgba(P.c[8], .25); ctx.fill();
+    ctx.strokeStyle = on ? P.c[1] : rgba(P.c[8], .6); ctx.lineWidth = 4; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-40, 2); ctx.quadraticCurveTo(-52, -2, -56, -18); ctx.strokeStyle = on ? P.c[2] : rgba(P.c[8], .6); ctx.lineWidth = 6; ctx.stroke();
+    ctx.restore();
+  }
+  const words = ['none', 'mild', 'warm', 'hot', 'very hot', 'fiery'];
+  text(ctx, words[P.heat] || '', x + 660, y + 108, 52, P.fg);
+  return y + 210;
+}
+
+// A log scale from 100 to 2 million Scoville units, with the range of this chili.
+function scovilleRow(ctx, P, x, y, width) {
+  heading(ctx, P, x, y, 'Scoville heat units');
+  const nums = (P.shu.match(/[\d,]+/g) || []).map(s => Number(s.replace(/,/g, ''))).filter(Boolean);
+  if (!nums.length) return y;
+  let lo = nums[0], hi = nums[nums.length - 1];
+  if (/about/.test(P.shu)) { lo *= .8; hi *= 1.2; }
+  const L = v => Math.log10(Math.max(v, 100)), x0 = x, x1 = x + width, y0 = y + 120;
+  const X = v => lerp(x0, x1, (L(v) - 2) / (Math.log10(2e6) - 2));
+  ctx.fillStyle = rgba(P.c[8], .25); ctx.beginPath(); ctx.roundRect(x0, y0 - 10, width, 20, 10); ctx.fill();
+  const g = ctx.createLinearGradient(x0, 0, x1, 0);
+  g.addColorStop(0, rgba(P.c[3], .5)); g.addColorStop(.5, rgba(P.c[11] || P.c[3], .6)); g.addColorStop(1, rgba(P.c[1], .7));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(x0, y0 - 10, width, 20, 10); ctx.fill();
+  ctx.fillStyle = P.accent; ctx.beginPath(); ctx.roundRect(X(lo) - 6, y0 - 26, Math.max(12, X(hi) - X(lo) + 12), 52, 26); ctx.fill();
+  [[100, '100'], [1e3, '1k'], [1e4, '10k'], [1e5, '100k'], [1e6, '1M']].forEach(([v, l]) => {
+    ctx.fillStyle = rgba(P.c[8], .8); ctx.fillRect(X(v) - 2, y0 + 30, 4, 18);
+    text(ctx, l, X(v), y0 + 92, 34, P.c[8], { align: 'center' });
+  });
+  text(ctx, P.shu, Math.min(X(hi), x1 - 10), y0 - 52, 46, P.fg, { align: X(hi) > x1 - 400 ? 'right' : 'center' });
+  return y + 240;
+}
+
+function swatchRow(ctx, P, x, y) {
+  heading(ctx, P, x, y, 'Colors');
+  const items = P.whole ? [['whole', P.whole.color], ['ground', P.ground]] : [['ground', P.ground]];
+  items.forEach(([label, hex], i) => {
+    const cx = x + 80 + i * 420, cy = y + 120;
+    ctx.fillStyle = 'rgba(0,0,0,.25)'; circle(ctx, cx + 6, cy + 8, 74); ctx.fill();
+    ctx.fillStyle = hex; circle(ctx, cx, cy, 74); ctx.fill();
+    ctx.strokeStyle = rgba(P.fg, .25); ctx.lineWidth = 3; circle(ctx, cx, cy, 74); ctx.stroke();
+    text(ctx, label, cx + 110, cy - 6, 46, P.fg);
+    text(ctx, hex, cx + 110, cy + 50, 36, P.c[8], { spacing: 2 });
+  });
+  return y + 240;
+}
+
+function containsRow(ctx, P, x, y) {
+  heading(ctx, P, x, y, 'Contains');
+  const list = P.mix;
+  list.forEach((m, i) => {
+    const col = i % 2, row = Math.floor(i / 2);
+    const cx = x + col * 740, cy = y + 110 + row * 96;
+    ctx.fillStyle = m.whole.color; circle(ctx, cx + 24, cy - 16, 22); ctx.fill();
+    ctx.strokeStyle = rgba(P.fg, .3); ctx.lineWidth = 3; circle(ctx, cx + 24, cy - 16, 22); ctx.stroke();
+    text(ctx, (m.name || m.whole.label || '').toLowerCase(), cx + 70, cy, 54, P.fg);
+  });
+  return y + 110 + Math.ceil(list.length / 2) * 96 + 30;
+}
+
+function card(ctx, P, r, noise) {
+  paperBase(ctx, P, noise);
+  let ty = titleBlock(ctx, P, 300, 420);
+  const chips = [P.origin, P.part !== 'Blend' ? P.part.toLowerCase() : 'blend'];
+  let cx = 300; ty += 60;
+  chips.forEach(cp => { cx += chip(ctx, P, cx, ty, cp) + 24; });
+
+  // The right column
+  const x = 2080, width = 1460;
+  let y = P.mix.length && !P.whole ? 520 : 470;
+  if (P.latin) {
+    heading(ctx, P, x, y, 'Botanical name');
+    text(ctx, P.latin, x - 4, y + 120, 92, P.fg, { font: SERIF, italic: true, weight: '300' });
+    y += 250;
+  }
+  if (P.mix.length && !P.whole) y = containsRow(ctx, P, x, y);
+  else y = partRow(ctx, P, x, y);
+  y = notesRow(ctx, P, x, y + 30);
+  y = heatRow(ctx, P, x, y + 20);
+  if (P.shu) y = scovilleRow(ctx, P, x, y + 30, width - 40);
+  else y = swatchRow(ctx, P, x, y + 30);
+  vignette(ctx, P, P.light ? .12 : .35);
+  grain(ctx, P.index * 29, .04);
+}
+
+// ---------- entry point ----------
+
+const KINDS = { card };
+
+window.renderImage = async (theme, kind, width, height, mime = 'image/png', quality = .92) => {
+  await document.fonts.load(`40px ${MONO}`);
+  await document.fonts.load(`300 40px ${SERIF}`);
+  await document.fonts.load(`italic 300 40px ${SERIF}`);
+  const cv = document.getElementById('c');
+  cv.width = width; cv.height = height;
+  const ctx = cv.getContext('2d');
+  S = width / W;
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+  const c = theme.colors;
+  const P = {
+    ...theme, light: c.mode === 'light', bg: c.background, fg: c.foreground, dfg: c.dark_foreground, darker: c.darker_background,
+    accent: c.accent, second: theme.second, c: theme.ansi, muted: c.muted, base: theme.base,
+  };
+  const r = rng(theme.index * 104729 + Object.keys(KINDS).indexOf(kind) * 7 + (P.light ? 3 : 0));
+  const noise = makeNoise(theme.index * 7907 + 3);
+  KINDS[kind](ctx, P, r, noise);
+  return cv.toDataURL(mime, quality);
+};
+</script>
+</body>
+</html>

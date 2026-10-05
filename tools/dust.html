@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Dust renderer</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Dust frames for the animated background. tools/dust.mjs calls renderDust()
+// once for each frame of the loop. A frame is white, and its alpha holds a
+// soft beam of light and the dust that drifts through it, so the same frames
+// serve every theme. The script colors them for each theme.
+//
+// The loop is seamless. Each mote moves along the beam for a fixed distance
+// in 1 loop and fades in and out on the way, so it is invisible where its
+// path starts again. Its sway, its turn and its twinkle use whole cycles of
+// the loop, and the haze in the beam mixes the field at time t with the field
+// at time t - T, like the steam of the coffee themes.
+
+const W = 1920, H = 1080;
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function smooth(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+
+function makeNoise(seed) {
+  const r = rng(seed), perm = new Uint8Array(512), grad = [];
+  const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  for (let i = 0; i < 256; i++) { const a = r() * Math.PI * 2; grad.push([Math.cos(a), Math.sin(a)]); }
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  function n(x, y) {
+    const x0 = Math.floor(x), y0 = Math.floor(y), sx = fade(x - x0), sy = fade(y - y0);
+    const X = x0 & 255, Y = y0 & 255, fx = x - x0, fy = y - y0;
+    const d = (dx, dy) => { const g = grad[perm[((X + dx) & 255) + perm[(Y + dy) & 255]]]; return g[0] * (fx - dx) + g[1] * (fy - dy); };
+    return lerp(lerp(d(0, 0), d(1, 0), sx), lerp(d(0, 1), d(1, 1), sx), sy);
+  }
+  n.fbm = (x, y, oct = 4) => { let s = 0, a = .5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f, y * f); a *= .5; f *= 2; } return s; };
+  return n;
+}
+
+// The beam comes from the left, where the lamp of the still is, and falls
+// across the board a little downward. a and b are its ends in design pixels.
+const BEAM = { a: [-200, 330], b: [2100, 700], width: 330 };
+const haze = makeNoise(53);
+
+// 0 to 1: how far a point is inside the beam.
+function beamAt(x, y) {
+  const [ax, ay] = BEAM.a, [bx, by] = BEAM.b;
+  const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy);
+  const u = ((x - ax) * dx + (y - ay) * dy) / (len * len);
+  const d = Math.abs((x - ax) * dy - (y - ay) * dx) / len;
+  // The beam widens a little away from the window.
+  const w = BEAM.width * (.8 + .4 * u);
+  return Math.exp(-Math.pow(d / w, 2) * 2.2) * smooth(u * 4);
+}
+
+// The motes: their start, their path along the beam, sway, size and twinkle.
+const motes = (() => {
+  const r = rng(7), list = [];
+  for (let i = 0; i < 2000; i++) {
+    const big = r() < .06;
+    list.push({
+      s0: r(), off: (r() - .5) * 2.2, travel: 120 + r() * 260, along: r(),
+      sway: 8 + r() * 26, kx: 1 + Math.floor(r() * 2), ky: 1 + Math.floor(r() * 2), px: r() * 6.283, py: r() * 6.283,
+      size: big ? 5 + r() * 9 : 1 + Math.pow(r(), 2.5) * 2.6, big,
+      tw: 1 + Math.floor(r() * 4), tp: r() * 6.283, bright: .35 + r() * .65,
+    });
+  }
+  return list;
+})();
+
+window.renderDust = (frame, frames, width, height) => {
+  const cv = document.getElementById('c');
+  cv.width = width; cv.height = height;
+  const ctx = cv.getContext('2d');
+  const k = width / W;
+  ctx.clearRect(0, 0, width, height);
+  const T = frame / frames;
+  // The haze of the beam, at a low resolution, scaled up smooth.
+  const hw = 240, hh = 135, hc = document.createElement('canvas'); hc.width = hw; hc.height = hh;
+  const hx = hc.getContext('2d'), img = hx.createImageData(hw, hh), d = img.data;
+  for (let j = 0, i = 0; j < hh; j++) for (let x = 0; x < hw; x++, i += 4) {
+    const X = (x + .5) * W / hw, Y = (j + .5) * H / hh;
+    const field = t => haze.fbm(X * .0018 + t * .9, Y * .0024 - t * .3, 4);
+    const v = (1 - T) * field(T) + T * field(T - 1);
+    const a = beamAt(X, Y) * (.1 + .07 * v);
+    d[i] = d[i + 1] = d[i + 2] = 255; d[i + 3] = clamp(a, 0, 1) * 255;
+  }
+  hx.putImageData(img, 0, 0);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(hc, 0, 0, width, height);
+  // The motes
+  const [ax, ay] = BEAM.a, [bx, by] = BEAM.b, len = Math.hypot(bx - ax, by - ay);
+  const ux = (bx - ax) / len, uy = (by - ay) / len, nx = -uy, ny = ux;
+  for (const m of motes) {
+    const s = (m.s0 + T) % 1;
+    const life = Math.sin(Math.PI * s);
+    const base = m.along * len + (s - .5) * m.travel;
+    let x = ax + ux * base + nx * m.off * BEAM.width + m.sway * Math.sin(2 * Math.PI * m.kx * T + m.px);
+    let y = ay + uy * base + ny * m.off * BEAM.width + m.sway * .6 * Math.sin(2 * Math.PI * m.ky * T + m.py);
+    const inBeam = beamAt(x, y);
+    const twinkle = .55 + .45 * Math.sin(2 * Math.PI * m.tw * T + m.tp);
+    const a = Math.min(1, life * inBeam * twinkle * m.bright * (m.big ? .26 : 1.25));
+    if (a < .01) continue;
+    const r = m.size * k;
+    const g = ctx.createRadialGradient(x * k, y * k, 0, x * k, y * k, r * (m.big ? 1 : 1.6));
+    g.addColorStop(0, `rgba(255,255,255,${a})`);
+    g.addColorStop(m.big ? .7 : .45, `rgba(255,255,255,${a * (m.big ? .8 : .5)})`);
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x * k, y * k, r * (m.big ? 1 : 1.6), 0, Math.PI * 2); ctx.fill();
+  }
+  return cv.toDataURL('image/png');
+};
+</script>
+</body>
+</html>
